@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Results</title></head>
+<body style="font-family: Arial, sans-serif; padding: 40px">
+  <p id="status">Loading...</p>
+  <ol id="results"></ol>
+  <script>
+    // Results appear client-side after a delay, like on DuckDuckGo.
+    const q = new URLSearchParams(location.search).get('q') || '';
+    setTimeout(() => {
+      document.getElementById('status').textContent = 'Results for: ' + q;
+      const list = document.getElementById('results');
+      for (let i = 1; i <= 3; i++) {
+        const li = document.createElement('li');
+        const a = document.createElement('a');
+        a.dataset.testid = 'result-title-a';
+        a.href = 'target.html?n=' + i;
+        a.textContent = 'Result ' + i + ' for ' + q;
+        li.appendChild(a);
+        list.appendChild(li);
+      }
+    }, 1500);
+  </script>
+</body>
+</html>
