@@ -6,7 +6,7 @@ Test task: Python + Playwright (sync API, Chromium). `capture_video.py` reads a 
 
 ![Frames from a real recording](docs/img/frames.png)
 
-A full recording made by this code: [docs/sample.webm](docs/sample.webm) (37 s, opens in the browser).
+A full recording made by this code: [docs/sample.webm](docs/sample.webm?raw=true) (37 s, 2.3 MB). GitHub does not play `.webm` on the page: download it and open it in a browser or any video player.
 
 ## Run
 
