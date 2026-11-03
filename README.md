@@ -100,7 +100,7 @@ They do not need the internet: a small local site in `tests/site/` copies the Du
 
 ## Checked by hand
 
-On Windows 11, Python 3.11, against the live DuckDuckGo on 3 November 2026: `input.csv` (Berlin, Stockholm, Manchester) gave 3 of 3 videos, several runs in a row. I watched the frames of every video: the cursor, the highlight, the typing, the ripple on each click, the results and the opened first result. One thing I cannot control: the first result for Manchester was designrush.com, which shows its own "security verification" page, so that video ends on it.
+On Windows 11 against the live DuckDuckGo on 3 November 2026: `input.csv` (Berlin, Stockholm, Manchester) gave 3 of 3 videos in several runs on Python 3.11, and once more from a fresh clone with a new Python 3.14 environment installed exactly as in "Run". I watched the frames of every video: the cursor, the highlight, the typing, the ripple on each click, the results and the opened first result. One thing I cannot control: the first result for Manchester was designrush.com, which shows its own "security verification" page, so that video ends on it.
 
 ## Not done
 
