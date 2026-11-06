@@ -10,10 +10,15 @@ import io
 import os
 import re
 import shutil
+import socket
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 import requests
 from werkzeug.serving import WSGIRequestHandler, make_server
@@ -108,6 +113,48 @@ class StartupTest(ServiceTestCase):
 
     def test_wal_mode(self):
         self.assertEqual(self.sql("PRAGMA journal_mode")[0][0], "wal")
+
+    def test_leftover_part_files_are_removed_on_start(self):
+        leftover = os.path.join(self.uploads, ".upload-abc.part")
+        open(leftover, "wb").close()
+        web_service.create_app(self.tmp)
+        self.assertFalse(os.path.exists(leftover))
+
+
+class RunAsScriptTest(unittest.TestCase):
+    """python web_service.py: FLASK_HOST / FLASK_PORT, files next to the script, not in the cwd."""
+
+    def test_python_web_service_py(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        service_dir, cwd = os.path.join(tmp, "service"), os.path.join(tmp, "elsewhere")
+        os.makedirs(service_dir)
+        os.makedirs(cwd)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        shutil.copy(os.path.join(root, "web_service.py"), service_dir)
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        env = dict(os.environ, FLASK_HOST="127.0.0.1", FLASK_PORT=str(port))
+        proc = subprocess.Popen([sys.executable, os.path.join(service_dir, "web_service.py")],
+                                cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(100):
+                try:
+                    resp = requests.get(f"http://127.0.0.1:{port}/videos", timeout=1,
+                                        proxies={"http": None})
+                    break
+                except requests.ConnectionError:
+                    time.sleep(0.1)
+            else:
+                self.fail("the service did not start")
+            self.assertEqual(resp.json(), {"videos": []})
+        finally:
+            proc.terminate()
+            proc.wait(10)
+        self.assertTrue(os.path.isfile(os.path.join(service_dir, "videos.db")))
+        self.assertTrue(os.path.isdir(os.path.join(service_dir, "uploads")))
+        self.assertEqual(os.listdir(cwd), [])
 
 
 class UploadTest(ServiceTestCase):
@@ -229,7 +276,20 @@ class ErrorTest(ServiceTestCase):
         self.assertNothingStored()
 
     def test_get_upload_is_405_json(self):
-        self.assertJsonError(self.client.get("/upload"), 405)
+        resp = self.client.get("/upload")
+        self.assertJsonError(resp, 405)
+        self.assertIn("POST", resp.headers["Allow"])
+
+    def test_file_in_use_is_503_and_keeps_the_old_video(self):
+        # Windows cannot replace a file that a player is reading: os.replace raises PermissionError.
+        first = fake_video()
+        self.upload("ACME", first)
+        with mock.patch.object(web_service.os, "replace", side_effect=PermissionError):
+            resp = self.upload("ACME", fake_video())
+        self.assertJsonError(resp, 503)
+        self.assertEqual(self.read("ACME.webm"), first)
+        self.assertEqual(self.files(), ["ACME.webm"])  # the temporary .part file is gone
+        self.assertEqual(len(self.rows()), 1)
 
     def test_too_large_is_413_json(self):
         self.app.config["MAX_CONTENT_LENGTH"] = 1000
@@ -270,11 +330,13 @@ class MediaTest(ServiceTestCase):
     def test_unknown_and_unsafe_paths_are_404(self):
         open(os.path.join(self.uploads, ".hidden.webm"), "wb").close()
         for url in ("/media/nope.webm", "/media/../videos.db", "/media/%2e%2e/videos.db",
-                    "/media/x/../../videos.db", "/media/.hidden.webm"):
+                    "/media/x/../../videos.db", "/media/.hidden.webm",
+                    "/media/x/../.hidden.webm", "/media/x/%2e%2e/.hidden.webm"):
             with self.subTest(url):
                 resp = self.get(url)
                 self.assertEqual(resp.status_code, 404)
                 self.assertNotIn(b"SQLite format", resp.get_data())
+                self.assertTrue(resp.is_json)  # the JSON 404, not a file
 
 
 class ConcurrencyTest(ServiceTestCase):

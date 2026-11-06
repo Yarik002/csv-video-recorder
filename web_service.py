@@ -51,7 +51,7 @@ WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"{p}{i}" for p in ("COM", "L
 
 
 class FileBusyError(Exception):
-    """The target file is open in another program (Windows only) and cannot be replaced."""
+    """The target file is open (for example a player streams it) and Windows cannot replace it."""
 
 
 # ---------- database layer ----------
@@ -165,8 +165,21 @@ def replace_file(src, dst, attempts=5):
 def _remove_quietly(path):
     try:
         os.remove(path)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as exc:
+        current_app.logger.warning("could not remove %s: %s", path, exc)
+
+
+def remove_if_unused(conn, path):
+    """Deletes a file no row points to any more (e.g. the company sent .mp4 after .webm).
+    Under the write lock, so no other upload can take this name at the same moment."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if path_owner(conn, path) is None:
+            _remove_quietly(path)
+    finally:
+        conn.commit()
 
 
 # ---------- web service ----------
@@ -187,6 +200,9 @@ def create_app(data_dir=None):
     app.json.ensure_ascii = False  # company names in Cyrillic stay readable
 
     os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+    for name in os.listdir(app.config["UPLOAD_FOLDER"]):
+        if name.startswith(".upload-") and name.endswith(".part"):  # left by a crash
+            os.remove(os.path.join(app.config["UPLOAD_FOLDER"], name))
     init_db(app.config["DATABASE"])
     app.teardown_appcontext(close_db)
 
@@ -222,16 +238,14 @@ def create_app(data_dir=None):
                 replace_file(tmp_path, file_path)
                 video_url = request.host_url + "media/" + quote(filename)
                 upsert_video(conn, company_name, file_path, video_url)
-                if old is not None and old["file_path"] != file_path:
-                    # e.g. the company sent .mp4 instead of .webm. Removed while we still
-                    # hold the lock, so no other upload can take this name in between.
-                    _remove_quietly(old["file_path"])
                 conn.commit()
             except BaseException:
                 conn.rollback()
                 raise
+            if old is not None and old["file_path"] != file_path:
+                remove_if_unused(conn, old["file_path"])
         except FileBusyError as exc:
-            return error(503, f"{exc} is open in another program, try again")
+            return error(503, f"{exc} is being read right now (Windows cannot replace an open file), try again")
         finally:
             _remove_quietly(tmp_path)  # already moved on success
 
@@ -247,7 +261,7 @@ def create_app(data_dir=None):
             return error(404, "company not found", company_name=company_name)
         return jsonify(company_name=row["company_name"], video_url=row["video_url"])
 
-    @app.get("/media/<path:filename>")
+    @app.get("/media/<filename>")  # no "/" in filename: uploads/ has no subfolders
     def media(filename):
         if filename.startswith("."):  # unfinished .part uploads
             abort(404)
@@ -273,7 +287,10 @@ def _json_error(exc):
         limit_mb = current_app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
         return error(413, f"file is too large (limit {limit_mb:g} MB)")
     message = getattr(exc, "description", None) if code != 500 else "internal server error"
-    return error(code, message or "error")
+    body, status = error(code, message or "error")
+    if code == 405:
+        body.headers["Allow"] = ", ".join(exc.valid_methods or [])
+    return body, status
 
 
 if __name__ == "__main__":
