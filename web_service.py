@@ -113,9 +113,10 @@ def upsert_video(conn, company_name, file_path, video_url):
 
 
 def path_owner(conn, file_path):
-    """Company that already uses this file, or None."""
+    """Company that already uses this file, or None. NOCASE: on Windows and macOS
+    'acme.webm' and 'ACME.webm' are the same file."""
     row = conn.execute(
-        "SELECT company_name FROM videos WHERE file_path = ?", (file_path,)
+        "SELECT company_name FROM videos WHERE file_path = ? COLLATE NOCASE", (file_path,)
     ).fetchone()
     return row["company_name"] if row else None
 
@@ -137,8 +138,9 @@ def safe_name(company_name):
 
 
 def choose_file_name(conn, uploads_dir, company_name, ext):
-    """File name for this company. Two companies never share a file:
-    'A B' and 'A_B' both give 'A_B', so the second one gets a hash suffix."""
+    """File name for this company. Two companies never share a file: 'A B' and
+    'A_B' (or 'acme' and 'ACME') would get the same name, so the second one gets
+    a hash suffix."""
     base = safe_name(company_name)
     for candidate in (base, f"{base}_{_short_hash(company_name)}"):
         path = os.path.join(uploads_dir, candidate + ext)
@@ -268,7 +270,8 @@ def create_app(data_dir=None):
 def _json_error(exc):
     code = getattr(exc, "code", 500) or 500
     if code == 413:
-        return error(413, f"file is too large (limit {MAX_UPLOAD_MB} MB)")
+        limit_mb = current_app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
+        return error(413, f"file is too large (limit {limit_mb:g} MB)")
     message = getattr(exc, "description", None) if code != 500 else "internal server error"
     return error(code, message or "error")
 
