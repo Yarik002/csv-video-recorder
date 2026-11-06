@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 video/
 .env
+videos.db
+videos.db-wal
+videos.db-shm
+uploads/
