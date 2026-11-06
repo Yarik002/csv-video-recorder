@@ -3,10 +3,12 @@
 Usage:
     python capture_video.py                      # input.csv -> ./video
     python capture_video.py my.csv --video-dir out --headless
+    python capture_video.py --server http://127.0.0.1:8000   # + upload and preview (Task 2)
 """
 
 import argparse
 import csv
+import math
 import sys
 import time
 
@@ -31,13 +33,58 @@ def read_rows(csv_path):
         return rows
 
 
+def _seconds(text):
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {text!r}")
+    return value
+
+
+def upload_and_preview(video_client, server_url, video_path, company_name, view_seconds):
+    """Task 2: upload the video, log its URL, open it in Chromium.
+    Returns (uploaded, previewed). Errors are printed, never raised, so the batch goes on."""
+    try:
+        url = video_client.UploadVideo(server_url, video_path, company_name)
+    except Exception as exc:
+        print(f"  upload failed: {exc}")
+        return False, False
+    print(f"  uploaded: {url}")
+    try:
+        video_client.PreviewVideo(url, view_seconds)
+    except Exception as exc:
+        first_line = str(exc).splitlines()[0] if str(exc) else ""
+        print(f"  preview failed: {exc.__class__.__name__}: {first_line}")
+        return True, False
+    return True, True
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Record a browser video for every CSV row.")
     parser.add_argument("csv", nargs="?", default="input.csv", help="input CSV (default: input.csv)")
     parser.add_argument("--video-dir", help=f"output folder (default: {qscript.PATH_TO_VIDEO_FOLDER})")
     parser.add_argument("--headless", action="store_true",
                         help="hide the browser window (DuckDuckGo blocks headless search)")
+    parser.add_argument("--server", metavar="URL",
+                        help="upload every video to this web service (python web_service.py) "
+                             "and preview it in Chromium, e.g. http://127.0.0.1:8000")
+    parser.add_argument("--view-seconds", type=_seconds, metavar="N",
+                        help="with --server: keep the preview open N seconds, "
+                             "0 = until Enter (default: 10)")
     args = parser.parse_args(argv)
+    if args.view_seconds is not None and not args.server:
+        parser.error("--view-seconds works only with --server")
+
+    video_client = None
+    if args.server:
+        # Imported only here: without --server the recorder does not need requests.
+        try:
+            import requests  # noqa: F401
+        except ImportError:
+            print("--server needs the requests package: pip install -r requirements.txt",
+                  file=sys.stderr)
+            return 2
+        import video_client
+        view_seconds = 10.0 if args.view_seconds is None else args.view_seconds
 
     if args.video_dir:
         qscript.PATH_TO_VIDEO_FOLDER = args.video_dir
@@ -54,7 +101,7 @@ def main(argv=None):
     for name in sorted({n for n in names if names.count(n) > 1}):
         print(f"Warning: company {name!r} appears more than once, its video will be overwritten")
 
-    failed = 0
+    failed = uploaded = previewed = 0
     for i, row in enumerate(rows, 1):
         print(f"[{i}/{len(rows)}] {row['Company Name']} ({row['City']})")
         started = time.time()
@@ -70,11 +117,21 @@ def main(argv=None):
         )
         if path:
             print(f"  saved: {path} ({time.time() - started:.0f} s)")
+            if video_client:
+                up, seen = upload_and_preview(
+                    video_client, args.server, path, row["Company Name"], view_seconds
+                )
+                uploaded += up
+                previewed += seen
         else:
             failed += 1
             print("  FAILED")
 
-    print(f"Done: {len(rows) - failed} of {len(rows)} videos saved.")
+    saved = len(rows) - failed
+    if video_client:
+        print(f"Done: {saved} of {len(rows)} videos saved, {uploaded} uploaded, {previewed} previewed.")
+        return 1 if failed or uploaded < saved or previewed < saved else 0
+    print(f"Done: {saved} of {len(rows)} videos saved.")
     return 1 if failed else 0
 
 
