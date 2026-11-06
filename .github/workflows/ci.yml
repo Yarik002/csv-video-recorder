@@ -6,7 +6,8 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest became 26.04 in Nov 2026; Playwright 1.60 (the last with Python 3.9) does not support it.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
