@@ -20,5 +20,6 @@ jobs:
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
-      - name: Offline tests (local copy of the search flow)
-        run: python -m unittest discover -s tests -v
+      - name: Offline tests (local search copy, web service, upload + preview)
+        # The preview opens Chromium with a window (headless=False), xvfb gives it a screen.
+        run: xvfb-run -a python -m unittest discover -s tests -v
