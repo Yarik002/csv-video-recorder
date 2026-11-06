@@ -4,14 +4,16 @@
 
 Two test tasks in one repository:
 
-- **Task 2** (this version): a Flask web service with SQLite. After recording, every video is uploaded, stored, can be looked up by company name and opens in Chromium. How to run it is right below, details in [Task 2: details](#task-2-details).
+- **Task 2** (latest, start here): a Flask web service with SQLite. After recording, every video is uploaded, stored, can be looked up by company name and opens in Chromium. How to run it is right below, details in [Task 2: details](#task-2-details).
 - **Task 1**: the CSV-driven browser recorder. It is unchanged; it is described in [Task 1: CSV-driven recorder](#task-1-csv-driven-recorder). The exact version I sent for Task 1 is the tag [`task-1`](https://github.com/Yarik002/csv-video-recorder/tree/task-1).
 
 ## Task 2: how to run
 
-Python 3.9 or newer. Install once (Windows, cmd or PowerShell):
+Python 3.9 or newer. Install once.
 
-```bash
+Windows (cmd or PowerShell):
+
+```bat
 git clone https://github.com/Yarik002/csv-video-recorder.git
 cd csv-video-recorder
 py -m venv .venv
@@ -20,25 +22,39 @@ pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-Then two terminals, both in the `csv-video-recorder` folder:
+If PowerShell says that running scripts is disabled, run `Set-ExecutionPolicy -Scope Process Bypass` first, or use cmd.
+
+Linux or macOS:
 
 ```bash
-# Terminal 1: the web service (creates videos.db and uploads/ next to web_service.py)
-.venv\Scripts\activate
+git clone https://github.com/Yarik002/csv-video-recorder.git
+cd csv-video-recorder
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install --with-deps chromium
+```
+
+Then two terminals, both in the `csv-video-recorder` folder with the venv activated (`.venv\Scripts\activate` on Windows, `source .venv/bin/activate` on Linux/macOS).
+
+Terminal 1, the web service:
+
+```bash
 python web_service.py
 ```
 
-```bash
-# Terminal 2: record the 3 rows of input.csv, upload each video and open it in Chromium
-.venv\Scripts\activate
-python capture_video.py --server http://127.0.0.1:8000
+```
+Database: C:\...\csv-video-recorder\videos.db
+Uploads:  C:\...\csv-video-recorder\uploads
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:8000
 ```
 
-On Linux or macOS: `python3 -m venv .venv` and `source .venv/bin/activate` instead of the two Windows lines, the rest is the same.
+Terminal 2, record the 3 rows of `input.csv`, upload each video and open it in Chromium:
 
-The service listens on `0.0.0.0:8000`. On the first start Windows may ask whether Python may use the network: allow it, or run the service only for this computer with `set FLASK_HOST=127.0.0.1` (cmd), `$env:FLASK_HOST="127.0.0.1"` (PowerShell) or `FLASK_HOST=127.0.0.1 python web_service.py` (Linux/macOS). `FLASK_PORT` changes the port.
-
-Terminal 2 output (a real run, 6 November 2026):
+```bash
+python capture_video.py --server http://127.0.0.1:8000
+```
 
 ```
 [1/3] Acme Retail GmbH (Berlin)
@@ -53,23 +69,37 @@ Terminal 2 output (a real run, 6 November 2026):
 Done: 3 of 3 videos saved, 3 uploaded, 3 previewed.
 ```
 
+The recorder needs a visible browser window: DuckDuckGo answers headless browsers with an error page (see [Headless](#headless)).
+
 After each upload a Chromium window opens the returned URL and its built-in player plays the video for 10 seconds (`--view-seconds N`; `--view-seconds 0` keeps it open until you press Enter):
 
 ![The preview window: Chromium plays the uploaded video from the service](docs/img/preview.png)
+
+Notes:
+- The service listens on `0.0.0.0:8000`. On the first start Windows may ask whether Python may use the network: allow it, or keep the service local with `FLASK_HOST=127.0.0.1`.
+- `FLASK_HOST` and `FLASK_PORT` change the address: `set FLASK_PORT=8080` (cmd), `$env:FLASK_PORT="8080"` (PowerShell), `FLASK_PORT=8080 python web_service.py` (Linux/macOS).
 
 Ask the service yourself (in PowerShell write `curl.exe`, plain `curl` there is another command):
 
 ```bash
 curl "http://127.0.0.1:8000/get_video_url?company_name=Acme%20Retail%20GmbH"
-{"company_name":"Acme Retail GmbH","video_url":"http://127.0.0.1:8000/media/Acme_Retail_GmbH.webm"}
-
 curl -X POST http://127.0.0.1:8000/upload -F "company_name=ACME GmbH" -F "file=@docs/sample.webm"
-{"company_name":"ACME GmbH","video_url":"http://127.0.0.1:8000/media/ACME_GmbH.webm"}
-
 curl http://127.0.0.1:8000/videos
 ```
 
-Tests (no internet needed): `python -m unittest discover -s tests -v`.
+Answers:
+
+```
+{"company_name":"Acme Retail GmbH","video_url":"http://127.0.0.1:8000/media/Acme_Retail_GmbH.webm"}
+{"company_name":"ACME GmbH","video_url":"http://127.0.0.1:8000/media/ACME_GmbH.webm"}
+{"videos":[{"company_name":"ACME GmbH","created_at":"2026-11-06 11:10:50","file_path":"C:\\...\\uploads\\ACME_GmbH.webm","id":10,"updated_at":"2026-11-06 11:10:50","video_url":"http://127.0.0.1:8000/media/ACME_GmbH.webm"}, ...]}
+```
+
+Tests, offline, about 2 minutes, they open Chromium windows (on Linux without a screen run them with `xvfb-run`):
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ### Acceptance checklist
 
@@ -77,7 +107,7 @@ Every item was checked by hand on Windows 11 on 6 November 2026 against the live
 
 | # | Item | Automated test | By hand |
 |---|---|---|---|
-| 1 | `pip install -r requirements.txt` works on a clean machine | CI installs into a fresh Ubuntu on 3.9, 3.12, 3.14 | fresh clone, new venv on Python 3.14 and 3.11 |
+| 1 | `pip install -r requirements.txt` works on a clean machine | CI installs into a fresh Ubuntu on 3.9, 3.12, 3.14 | fresh clone from GitHub into an empty folder, new venv on Python 3.14 and on 3.11 |
 | 2 | `python web_service.py` starts and creates `videos.db` and `uploads/` | `RunAsScriptTest` (real `python web_service.py`), `StartupTest` (exact schema, WAL) | yes, both appeared on start |
 | 3 | `POST /upload` returns 200 and a working URL | `UploadTest`, `ClientTest` | 3 recorded videos + curl |
 | 4 | The URL serves the file (HTTP 200) and plays in a browser | `MediaTest` (200, `video/webm`, Range gives 206), `test_preview_opens_the_url` | Chromium played it, screenshot above (0:05 of 0:31, not paused) |
@@ -85,7 +115,7 @@ Every item was checked by hand on Windows 11 on 6 November 2026 against the live
 | 6 | The DB stores `company_name`, `file_path`, `video_url` | `test_upload_returns_url_and_saves_file` (absolute path, no BLOB column) | printed the table |
 | 7 | Re-upload of the same company updates the record, no duplicates | `test_reupload_updates_same_row`, 20 parallel uploads | second batch run: still 3 rows, same `id` and `created_at`, new `updated_at` |
 | 8 | `capture_video.py --server http://127.0.0.1:8000` uploads each video and opens it in Chromium | `EndToEndTest` (local copy of the search page), `BatchLoopTest` | 3 of 3 uploaded and previewed |
-| 9 | Works end to end on a clean machine after `pip install` and `playwright install chromium` | CI | fresh clone, steps above, live DuckDuckGo |
+| 9 | Works end to end on a clean machine after `pip install` and `playwright install chromium` | CI | fresh clone, Python 3.14, steps above: 50 tests pass, live run 3 of 3 uploaded and previewed |
 
 Also checked by hand: with the service stopped, the batch still records all 3 videos, logs `upload failed: cannot reach http://127.0.0.1:8000/upload: ConnectionError` for each and exits with code 1; `--view-seconds 0` keeps the window until Enter.
 
@@ -151,7 +181,7 @@ so the row keeps its `id` and `created_at`.
 
 ### Decisions worth knowing
 
-- **File names.** `ACME GmbH` becomes `ACME_GmbH.webm`, as in the task: every character except `A-Z a-z 0-9 . _ -` becomes `_`. I do not use `werkzeug.utils.secure_filename`: werkzeug is a separate package, and the task allows only flask, requests and playwright. Different companies can give the same name (`A B` and `A_B`; `acme` and `ACME` on Windows, where file names ignore case), so before saving the service checks in the database whether another company already uses this file; if so, it adds the first 8 characters of the SHA-1 of the company name (`A_B_2429e5cb.webm`). Names with no Latin letters or digits (`ООО Ромашка`) and Windows device names (`CON`) get `video_<hash>`.
+- **File names.** `ACME GmbH` becomes `ACME_GmbH.webm`, as in the task: every character except `A-Z a-z 0-9 . _ -` becomes `_`. This is my own small rule, not `werkzeug.utils.secure_filename`: werkzeug comes only as a dependency of Flask, and the task lists flask, requests and playwright as the allowed libraries. Different companies can give the same name (`A B` and `A_B`; `acme` and `ACME` on Windows, where file names ignore case), so before saving the service checks in the database whether another company already uses this file; if so, it adds the first 8 characters of the SHA-1 of the company name (`A_B_2429e5cb.webm`). Names with no Latin letters or digits (`ООО Ромашка`) and Windows device names (`CON`) get `video_<hash>`.
 - **Atomic save.** The upload is written to a temporary `.part` file in `uploads/`, then moved over the old file with `os.replace`, so a player never gets half a file. Choosing the name, moving the file and writing the row run under one write lock (`BEGIN IMMEDIATE`), so two parallel uploads cannot pick the same name.
 - **A file that is being played.** On Windows a file that is open cannot be replaced. I checked it: while a client was downloading `Enter_Check_Co.webm`, a re-upload of that company got `503 {"error": "... is being read right now ..."}` after 5 tries in 0.8 s; after the download was closed, the same upload returned 200.
 - **Errors in the batch.** A failed upload prints `upload failed: <reason>`, a failed preview prints `preview failed: <reason>`, and the loop goes on with the next row. The last line counts saved, uploaded and previewed videos; the exit code is 1 if any of them failed.
