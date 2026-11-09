@@ -96,7 +96,7 @@ Checked on Windows 11 with Docker Desktop (Docker 29.8.2, Compose 5.6.0) on 9 No
 | 4 | After `docker compose down` and `docker compose up` data and videos are preserved | `down` (without `-v`), `up`: the same row and a byte-identical video; smoke script `check` |
 | 5 | `web` waits for `db` and does not crash on startup | see [Waiting for the database](#waiting-for-the-database): `depends_on: service_healthy`, plus the service itself retries; tested with `db` stopped |
 
-Also checked by hand: `python capture_video.py --server http://localhost:8000` on the live DuckDuckGo, all 3 rows of `input.csv` recorded, uploaded to the Docker service and played in the preview window (the Manchester row needed two retries: DuckDuckGo did not open within 30 s on my slow network, before the service was involved). The 57 tests pass locally against `postgres:16` and in CI on Python 3.9, 3.12, 3.14.
+Also checked by hand: `python capture_video.py --server http://localhost:8000` on the live DuckDuckGo, all 3 rows of `input.csv` recorded, uploaded to the Docker service and played in the preview window (the Manchester row needed two retries: DuckDuckGo did not open within 30 s on my slow network, before the service was involved). The 57 tests pass locally against `postgres:16` and in CI on Python 3.9, 3.12, 3.14. Before sending I cloned the repository from GitHub into an empty folder and followed this README: both containers healthy, the `curl` checks, `down`/`up`, and the tests in a new Python 3.14 venv (57 OK).
 
 ## Internship task 1: how it works
 
