@@ -1,17 +1,18 @@
 """Tests for web_service.py: Flask test client plus one real threaded server.
 
-Every test gets its own temporary folder with videos.db and uploads/.
+Every test gets an empty PostgreSQL test database (the table is dropped) and its
+own temporary uploads/ folder. Database settings: see tests/db_helper.py.
 
 Run: python -m unittest tests.test_web_service -v
 """
 
 import contextlib
+import datetime
 import io
 import os
 import re
 import shutil
 import socket
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -20,10 +21,15 @@ import time
 import unittest
 from unittest import mock
 
+import psycopg2
+import psycopg2.errors
 import requests
 from werkzeug.serving import WSGIRequestHandler, make_server
 
 import web_service
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from db_helper import SETTINGS, needs_db, reset_db, sql  # noqa: E402
 
 
 class QuietHandler(WSGIRequestHandler):
@@ -31,18 +37,25 @@ class QuietHandler(WSGIRequestHandler):
         pass  # no "POST /upload 200" line for every request
 
 
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 def fake_video(size=64):
     """WebM magic bytes plus random data, different on every call."""
     return b"\x1a\x45\xdf\xa3" + os.urandom(size)
 
 
+@needs_db
 class ServiceTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.app = web_service.create_app(self.tmp)
+        reset_db()
+        self.app = web_service.create_app(self.tmp, db=SETTINGS)
         self.client = self.app.test_client()
         self.uploads = os.path.join(os.path.abspath(self.tmp), "uploads")
-        self.db_path = os.path.join(os.path.abspath(self.tmp), "videos.db")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -57,11 +70,8 @@ class ServiceTestCase(unittest.TestCase):
         return self.client.post("/upload", data=form, content_type="multipart/form-data", **kwargs)
 
     def sql(self, query, args=()):
-        """Runs one statement on videos.db directly and returns all rows."""
-        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
-            rows = conn.execute(query, args).fetchall()
-            conn.commit()
-        return rows
+        """Runs one statement on the test database directly and returns all rows."""
+        return sql(query, args)
 
     def rows(self):
         return self.sql("SELECT company_name, file_path, video_url, id, created_at, updated_at FROM videos")
@@ -84,47 +94,145 @@ class ServiceTestCase(unittest.TestCase):
 
 
 class StartupTest(ServiceTestCase):
-    def test_db_and_uploads_exist_before_any_request(self):
-        self.assertTrue(os.path.isfile(self.db_path))
+    def test_table_and_uploads_exist_before_any_request(self):
+        self.assertEqual(self.sql("SELECT to_regclass('videos') IS NOT NULL")[0][0], True)
         self.assertTrue(os.path.isdir(self.uploads))
 
     def test_schema(self):
-        columns = [(name, type_, notnull, pk) for _, name, type_, notnull, _, pk
-                   in self.sql("PRAGMA table_info(videos)")]
+        columns = self.sql(
+            "SELECT column_name, data_type, is_nullable, is_identity FROM information_schema.columns"
+            " WHERE table_name = 'videos' ORDER BY ordinal_position")
         self.assertEqual(columns, [
-            ("id", "INTEGER", 0, 1),
-            ("company_name", "TEXT", 1, 0),
-            ("file_path", "TEXT", 1, 0),
-            ("video_url", "TEXT", 1, 0),
-            ("created_at", "TEXT", 1, 0),
-            ("updated_at", "TEXT", 1, 0),
+            ("id", "integer", "NO", "YES"),
+            ("company_name", "text", "NO", "NO"),
+            ("file_path", "text", "NO", "NO"),
+            ("video_url", "text", "NO", "NO"),
+            ("created_at", "timestamp with time zone", "NO", "NO"),
+            ("updated_at", "timestamp with time zone", "NO", "NO"),
         ])
-        self.assertNotIn("BLOB", [c[1] for c in columns])
-        table_sql = self.sql("SELECT sql FROM sqlite_master WHERE name = 'videos'")[0][0]
-        self.assertIn("AUTOINCREMENT", table_sql)
+        self.assertNotIn("bytea", [c[1] for c in columns])  # no video bytes in the database
+        self.assertEqual(self.constraint_columns("PRIMARY KEY"), [("id",)])
+
+    def constraint_columns(self, kind):
+        return self.sql(
+            "SELECT k.column_name FROM information_schema.table_constraints c"
+            " JOIN information_schema.key_column_usage k USING (constraint_name, table_name)"
+            " WHERE c.table_name = 'videos' AND c.constraint_type = %s", (kind,))
 
     def test_company_name_is_unique(self):
-        unique = [row for row in self.sql("PRAGMA index_list(videos)") if row[2] == 1]
-        columns = [self.sql(f"PRAGMA index_info('{row[1]}')")[0][2] for row in unique]
-        self.assertEqual(columns, ["company_name"])
+        self.assertEqual(self.constraint_columns("UNIQUE"), [("company_name",)])
         self.sql("INSERT INTO videos (company_name, file_path, video_url) VALUES ('X', 'a', 'b')")
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(psycopg2.errors.UniqueViolation):
             self.sql("INSERT INTO videos (company_name, file_path, video_url) VALUES ('X', 'c', 'd')")
 
-    def test_wal_mode(self):
-        self.assertEqual(self.sql("PRAGMA journal_mode")[0][0], "wal")
+    def test_restart_keeps_the_data(self):
+        self.upload("ACME", fake_video())
+        web_service.create_app(self.tmp, db=SETTINGS)  # CREATE TABLE IF NOT EXISTS
+        self.assertEqual([r[0] for r in self.rows()], ["ACME"])
+
+    def test_two_processes_create_the_table_at_once(self):
+        # Apache starts 2 daemon processes, both run create_app() at the same moment.
+        # Without the advisory lock CREATE TABLE IF NOT EXISTS can fail in one of them.
+        errors = []
+        for _ in range(5):
+            reset_db()
+            barrier = threading.Barrier(8)
+
+            def start():
+                conn = web_service.connect(SETTINGS)
+                try:
+                    barrier.wait()
+                    web_service.init_db(conn)
+                except Exception as exc:  # noqa: BLE001 - collected and checked below
+                    errors.append(repr(exc))
+                finally:
+                    conn.close()
+
+            threads = [threading.Thread(target=start) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+        self.assertEqual(errors, [])
+        self.assertEqual(self.sql("SELECT count(*) FROM videos")[0][0], 0)
 
     def test_leftover_part_files_are_removed_on_start(self):
         leftover = os.path.join(self.uploads, ".upload-abc.part")
         open(leftover, "wb").close()
-        web_service.create_app(self.tmp)
+        web_service.create_app(self.tmp, db=SETTINGS)
         self.assertFalse(os.path.exists(leftover))
 
+    def test_database_down_during_a_request_is_503_json(self):
+        self.app.config["DB"] = dict(SETTINGS, port=str(free_port()))
+        with contextlib.redirect_stderr(io.StringIO()):
+            resp = self.client.get("/videos")
+        self.assertJsonError(resp, 503)
+        self.assertIn("database is not available", resp.get_json()["error"])
 
+
+class SettingsTest(unittest.TestCase):
+    """Database settings come only from the environment."""
+
+    def test_from_environment(self):
+        env = {"DB_HOST": "db", "DB_PORT": "5432", "DB_NAME": "videos", "DB_USER": "u", "DB_PASSWORD": "p"}
+        self.assertEqual(web_service.db_settings(env),
+                         {"host": "db", "port": "5432", "dbname": "videos", "user": "u", "password": "p"})
+        del env["DB_PORT"]
+        self.assertEqual(web_service.db_settings(env)["port"], "5432")
+
+    def test_missing_settings_are_named(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            web_service.db_settings({"DB_HOST": "db"})
+        self.assertIn("DB_NAME, DB_USER, DB_PASSWORD", str(ctx.exception))
+
+    def test_password_is_not_in_the_description(self):
+        settings = {"host": "db", "port": "5432", "dbname": "videos", "user": "u", "password": "secret"}
+        self.assertEqual(web_service.describe(settings), "u@db:5432/videos")
+
+
+class WaitForDatabaseTest(unittest.TestCase):
+    """The service waits for the database instead of crashing on start."""
+
+    def test_retries_until_the_database_answers(self):
+        calls = []
+
+        def flaky_connect(settings):
+            calls.append(1)
+            if len(calls) < 3:
+                raise psycopg2.OperationalError("the database system is starting up")
+            return "connection"
+
+        settings = {"host": "db", "port": "5432", "dbname": "v", "user": "u", "password": "p"}
+        with mock.patch.object(web_service, "connect", side_effect=flaky_connect), \
+                mock.patch.object(web_service.time, "sleep") as sleep, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            conn = web_service.wait_for_db(settings, timeout=60)
+        self.assertEqual(conn, "connection")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertIn("waiting for the database u@db:5432/v (attempt 1)", err.getvalue())
+        self.assertIn("database is ready after 3 attempts", err.getvalue())
+
+    def test_gives_up_with_a_clear_error(self):
+        settings = {"host": "127.0.0.1", "port": str(free_port()), "dbname": "videos_test",
+                    "user": "u", "password": "secret"}
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.dict(os.environ, {"DB_WAIT_SECONDS": "1"}):
+            with self.assertRaises(RuntimeError) as ctx:
+                web_service.create_app(tmp, db=settings)
+        self.assertIn("database u@127.0.0.1:", str(ctx.exception))
+        self.assertIn("is not ready after 1 s", str(ctx.exception))
+        self.assertNotIn("secret", str(ctx.exception))
+
+
+@needs_db
 class RunAsScriptTest(unittest.TestCase):
-    """python web_service.py: FLASK_HOST / FLASK_PORT, files next to the script, not in the cwd."""
+    """python web_service.py: FLASK_HOST / FLASK_PORT, uploads/ next to the script, not in the cwd."""
 
     def test_python_web_service_py(self):
+        reset_db()
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
         service_dir, cwd = os.path.join(tmp, "service"), os.path.join(tmp, "elsewhere")
@@ -132,10 +240,9 @@ class RunAsScriptTest(unittest.TestCase):
         os.makedirs(cwd)
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         shutil.copy(os.path.join(root, "web_service.py"), service_dir)
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
+        port = free_port()
         env = dict(os.environ, FLASK_HOST="127.0.0.1", FLASK_PORT=str(port))
+        env.update({name: SETTINGS[key] for key, name in web_service.DB_ENV.items()})
         proc = subprocess.Popen([sys.executable, os.path.join(service_dir, "web_service.py")],
                                 cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
@@ -152,7 +259,7 @@ class RunAsScriptTest(unittest.TestCase):
         finally:
             proc.terminate()
             proc.wait(10)
-        self.assertTrue(os.path.isfile(os.path.join(service_dir, "videos.db")))
+        self.assertEqual(sql("SELECT to_regclass('videos') IS NOT NULL")[0][0], True)
         self.assertTrue(os.path.isdir(os.path.join(service_dir, "uploads")))
         self.assertEqual(os.listdir(cwd), [])
 
@@ -178,15 +285,16 @@ class UploadTest(ServiceTestCase):
 
     def test_reupload_updates_same_row(self):
         self.upload("ACME", fake_video())
-        self.sql("UPDATE videos SET created_at = '2000-01-01 00:00:00', updated_at = '2000-01-01 00:00:00'")
+        self.sql("UPDATE videos SET created_at = '2000-01-01 00:00:00+00', updated_at = '2000-01-01 00:00:00+00'")
+        old = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
         row_id = self.rows()[0][3]
         new_data = fake_video()
         self.assertEqual(self.upload("ACME", new_data).status_code, 200)
         rows = self.rows()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][3], row_id)
-        self.assertEqual(rows[0][4], "2000-01-01 00:00:00")
-        self.assertNotEqual(rows[0][5], "2000-01-01 00:00:00")
+        self.assertEqual(rows[0][4], old)
+        self.assertGreater(rows[0][5], old)
         self.assertEqual(self.read("ACME.webm"), new_data)
 
     def test_reupload_other_extension_removes_old_file(self):
@@ -259,6 +367,8 @@ class LookupAndListTest(ServiceTestCase):
         self.assertEqual([v["company_name"] for v in videos], ["Alpha", "Mid", "Zeta"])
         self.assertEqual(set(videos[0]), {"id", "company_name", "file_path", "video_url",
                                           "created_at", "updated_at"})
+        created = datetime.datetime.fromisoformat(videos[0]["created_at"])  # ISO 8601 text
+        self.assertIsNotNone(created.tzinfo)
 
 
 class ErrorTest(ServiceTestCase):

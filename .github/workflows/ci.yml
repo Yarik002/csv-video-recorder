@@ -12,6 +12,26 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.9", "3.12", "3.14"]
+    services:
+      # A throwaway PostgreSQL for the tests, the same image as in docker-compose.yml.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: videos_test
+          POSTGRES_USER: video_user
+          POSTGRES_PASSWORD: ci_test_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U video_user -d videos_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_NAME: videos_test
+      DB_USER: video_user
+      DB_PASSWORD: ci_test_only
+      REQUIRE_DB: "1"  # fail, not skip, if the database is missing
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,6 +41,37 @@ jobs:
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
-      - name: Offline tests (local search copy, web service, upload + preview)
+      - name: Offline tests (local search copy, web service on PostgreSQL, upload + preview)
         # The preview opens Chromium with a window (headless=False), xvfb gives it a screen.
         run: xvfb-run -a python -m unittest discover -s tests -v
+
+  docker:
+    # Internship task 1: build the image, start web + db with Compose, check from outside.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the client
+        run: pip install requests==2.32.5
+      - name: .env with a random password
+        run: |
+          cp .env.example .env
+          sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=$(openssl rand -hex 16)/" .env
+      - name: docker compose up --build
+        run: docker compose up --build -d --wait --wait-timeout 180
+      - name: Upload, URL, lookup
+        run: python scripts/docker_smoke.py upload
+      - name: docker compose down, then up again
+        run: |
+          docker compose down
+          docker compose up -d --wait --wait-timeout 120
+      - name: Data and video are still there
+        run: python scripts/docker_smoke.py check
+      - name: Logs
+        if: always()
+        run: docker compose logs
+      - name: Clean up
+        if: always()
+        run: docker compose down -v

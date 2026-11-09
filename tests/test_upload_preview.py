@@ -1,6 +1,7 @@
 """Task 2, client side: video_client.py and capture_video.py --server.
 
-A real web_service runs in a thread on a free port, with its data in a temp folder.
+A real web_service runs in a thread on a free port, with uploads/ in a temp folder
+and the PostgreSQL test database (tests/db_helper.py).
 The preview opens a Chromium window (headless=False, as the task says), so on a
 machine without a screen run the tests under xvfb-run (see .github/workflows/ci.yml).
 """
@@ -13,7 +14,6 @@ import logging
 import os
 import shutil
 import socket
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -30,6 +30,7 @@ import capture_video  # noqa: E402
 import qscript  # noqa: E402
 import video_client  # noqa: E402
 import web_service  # noqa: E402
+from db_helper import SETTINGS, needs_db, reset_db, sql  # noqa: E402
 from test_recorder import LocalSite, write_csv  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,7 +44,8 @@ class LiveServer:
 
     def __enter__(self):
         self.tmp = tempfile.mkdtemp()
-        self.app = web_service.create_app(self.tmp)
+        reset_db()
+        self.app = web_service.create_app(self.tmp, db=SETTINGS)
         self.paths = []
         self.app.after_request(self._log)
         self.server = make_server("127.0.0.1", 0, self.app, threaded=True)
@@ -63,12 +65,7 @@ class LiveServer:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def rows(self):
-        conn = sqlite3.connect(self.app.config["DATABASE"])
-        conn.row_factory = sqlite3.Row
-        try:
-            return [dict(r) for r in conn.execute("SELECT * FROM videos ORDER BY id")]
-        finally:
-            conn.close()
+        return sql("SELECT * FROM videos ORDER BY id", dicts=True)
 
 
 def free_port():
@@ -85,6 +82,7 @@ def run_main(argv):
     return code, out.getvalue()
 
 
+@needs_db
 class ClientTest(unittest.TestCase):
     def setUp(self):
         self.server = LiveServer().__enter__()
@@ -178,6 +176,7 @@ class LazyImportTest(unittest.TestCase):
             self.assertIn("needs the requests package", err.getvalue())
 
 
+@needs_db
 class BatchLoopTest(unittest.TestCase):
     """capture_video --server: a failed upload or preview never stops the loop."""
 
@@ -229,6 +228,7 @@ class BatchLoopTest(unittest.TestCase):
                 capture_video.main([self.csv] + argv)
 
 
+@needs_db
 class EndToEndTest(unittest.TestCase):
     """Real recording on the local search copy -> real upload -> real preview window."""
 
