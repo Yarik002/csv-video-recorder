@@ -1,8 +1,13 @@
-"""Web service for Test Task 2: upload a video, look it up by company name, play it.
+"""Video web service: upload a video, look it up by company name, play it.
 
-Run:
+Internship task 1: the database is PostgreSQL (it was SQLite in Test Task 2).
+In Docker, Apache + mod_wsgi runs the app (Dockerfile, apache/video-service.conf,
+web_service.wsgi). Without Docker it still runs on the Flask dev server:
     python web_service.py          # listens on 0.0.0.0:8000
-    FLASK_HOST=127.0.0.1 FLASK_PORT=8080 python web_service.py
+
+Database settings come only from environment variables:
+    DB_HOST, DB_PORT (default 5432), DB_NAME, DB_USER, DB_PASSWORD
+    DB_WAIT_SECONDS  how long to wait for the database on start (default 60)
 
 Endpoints:
     POST /upload                          multipart: file, company_name -> {company_name, video_url}
@@ -10,18 +15,21 @@ Endpoints:
     GET  /media/<filename>                the stored video file (Range requests work)
     GET  /videos                          all records
 
-The database (videos.db) and the uploads/ folder are created next to this file
-on start. The database keeps only the path and the URL, the video stays on disk.
+The uploads/ folder is next to this file. The database keeps only the path and
+the URL, the video stays on disk.
 """
 
+import datetime
 import hashlib
 import os
 import re
-import sqlite3
+import sys
 import tempfile
 import time
 from urllib.parse import quote
 
+import psycopg2
+import psycopg2.extras
 from flask import Flask, abort, current_app, g, jsonify, request, send_from_directory
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,14 +37,22 @@ MAX_UPLOAD_MB = 500
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    company_name TEXT    NOT NULL UNIQUE,
-    file_path    TEXT    NOT NULL,  -- absolute path to the file on disk
-    video_url    TEXT    NOT NULL,  -- public URL to the video
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
-);
+    id           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    company_name TEXT        NOT NULL UNIQUE,
+    file_path    TEXT        NOT NULL,  -- absolute path to the file on disk
+    video_url    TEXT        NOT NULL,  -- public URL to the video
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
 """
+
+# Keys for pg_advisory_xact_lock: a lock that lives until the end of the transaction
+# and is shared by all processes that use this database.
+SCHEMA_LOCK = 7270001   # creating the table (two Apache processes start at once)
+UPLOADS_LOCK = 7270002  # choosing a file name + moving the file + writing the row
+
+# Environment variable for every psycopg2.connect() argument.
+DB_ENV = {"host": "DB_HOST", "port": "DB_PORT", "dbname": "DB_NAME", "user": "DB_USER", "password": "DB_PASSWORD"}
 
 # Extensions a browser can play, with the Content-Type to send. Set by hand:
 # on Windows the mimetypes module reads the registry and can be wrong.
@@ -54,71 +70,127 @@ class FileBusyError(Exception):
     """The target file is open (for example a player streams it) and Windows cannot replace it."""
 
 
+def log(message):
+    # Under mod_wsgi stderr goes to the Apache error log (docker compose logs web).
+    print(f"[web_service] {message}", file=sys.stderr, flush=True)
+
+
 # ---------- database layer ----------
 
-def connect(db_path):
-    # timeout + busy_timeout: a writer waits for the lock instead of failing
-    # with "database is locked".
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 10000")
-    return conn
+def db_settings(environ=None):
+    """psycopg2.connect() arguments from DB_* environment variables. Nothing is hard-coded."""
+    environ = os.environ if environ is None else environ
+    settings = {key: environ.get(name, "") for key, name in DB_ENV.items()}
+    settings["port"] = settings["port"] or "5432"
+    missing = [DB_ENV[key] for key, value in settings.items() if not value]
+    if missing:
+        raise RuntimeError("database settings missing in the environment: " + ", ".join(missing))
+    return settings
 
 
-def init_db(db_path):
-    """Creates videos.db and the table. WAL mode is stored in the file itself."""
-    conn = connect(db_path)
-    try:
-        conn.execute("PRAGMA journal_mode = WAL")  # readers do not block the writer
-        conn.executescript(SCHEMA)
-    finally:
-        conn.close()
+def describe(settings):
+    """user@host:port/dbname, without the password, for logs and errors."""
+    return f"{settings['user']}@{settings['host']}:{settings['port']}/{settings['dbname']}"
+
+
+def connect(settings):
+    # RealDictCursor: rows come back as dicts, like sqlite3.Row in Test Task 2.
+    return psycopg2.connect(connect_timeout=5, cursor_factory=psycopg2.extras.RealDictCursor, **settings)
+
+
+def wait_for_db(settings, timeout):
+    """Connects, retrying once a second until the database accepts connections.
+    Docker Compose already starts web after db is healthy; this covers the rest
+    (a restart of db, running without Compose)."""
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            conn = connect(settings)
+        except psycopg2.OperationalError as exc:
+            reason = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"database {describe(settings)} is not ready after {timeout:g} s: {reason}") from exc
+            log(f"waiting for the database {describe(settings)} (attempt {attempt}): {reason}")
+            time.sleep(1)
+        else:
+            if attempt > 1:
+                log(f"database is ready after {attempt} attempts")
+            return conn
+
+
+def lock(conn, key):
+    """Takes an advisory lock till the end of the current transaction (other processes wait)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (key,))
+
+
+def init_db(conn):
+    """Creates the table if it is not there yet. Under a lock: CREATE TABLE IF NOT EXISTS
+    from two processes at the same moment can still fail in PostgreSQL."""
+    with conn:  # one transaction, committed at the end
+        lock(conn, SCHEMA_LOCK)
+        with conn.cursor() as cur:
+            cur.execute(SCHEMA)
 
 
 def get_db():
-    """One connection per request, kept in flask.g (Flask serves requests in threads)."""
+    """One connection per request, kept in flask.g. A psycopg2 connection is not shared
+    between threads, and Apache runs several threads and processes."""
     if "db" not in g:
-        g.db = connect(current_app.config["DATABASE"])
+        g.db = connect(current_app.config["DB"])
     return g.db
 
 
 def close_db(exc=None):
     conn = g.pop("db", None)
     if conn is not None:
-        conn.close()
+        conn.close()  # an unfinished transaction is rolled back
+
+
+def fetch(conn, query, args=(), one=False):
+    with conn.cursor() as cur:
+        cur.execute(query, args)
+        return cur.fetchone() if one else cur.fetchall()
 
 
 def find_video(conn, company_name):
-    return conn.execute(
-        "SELECT * FROM videos WHERE company_name = ?", (company_name,)
-    ).fetchone()
+    return fetch(conn, "SELECT * FROM videos WHERE company_name = %s", (company_name,), one=True)
 
 
 def list_videos(conn):
-    return conn.execute("SELECT * FROM videos ORDER BY company_name").fetchall()
+    return fetch(conn, "SELECT * FROM videos ORDER BY company_name")
 
 
 def upsert_video(conn, company_name, file_path, video_url):
     """Insert, or update the row of the same company: id and created_at stay."""
-    conn.execute(
-        """
-        INSERT INTO videos (company_name, file_path, video_url) VALUES (?, ?, ?)
-        ON CONFLICT(company_name) DO UPDATE SET
-            file_path  = excluded.file_path,
-            video_url  = excluded.video_url,
-            updated_at = datetime('now')
-        """,
-        (company_name, file_path, video_url),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO videos (company_name, file_path, video_url) VALUES (%s, %s, %s)
+            ON CONFLICT (company_name) DO UPDATE SET
+                file_path  = EXCLUDED.file_path,
+                video_url  = EXCLUDED.video_url,
+                updated_at = NOW()
+            """,
+            (company_name, file_path, video_url),
+        )
 
 
 def path_owner(conn, file_path):
-    """Company that already uses this file, or None. NOCASE: on Windows and macOS
-    'acme.webm' and 'ACME.webm' are the same file."""
-    row = conn.execute(
-        "SELECT company_name FROM videos WHERE file_path = ? COLLATE NOCASE", (file_path,)
-    ).fetchone()
+    """Company that already uses this file, or None. Compared without case: on Windows
+    and macOS (python web_service.py there) 'acme.webm' and 'ACME.webm' are the same file."""
+    row = fetch(conn, "SELECT company_name FROM videos WHERE lower(file_path) = lower(%s)",
+                (file_path,), one=True)
     return row["company_name"] if row else None
+
+
+def to_json(row):
+    """TIMESTAMPTZ comes back as datetime; JSON gets ISO 8601 text."""
+    return {key: value.isoformat() if isinstance(value, datetime.datetime) else value
+            for key, value in row.items()}
 
 
 # ---------- file names ----------
@@ -173,13 +245,11 @@ def _remove_quietly(path):
 
 def remove_if_unused(conn, path):
     """Deletes a file no row points to any more (e.g. the company sent .mp4 after .webm).
-    Under the write lock, so no other upload can take this name at the same moment."""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    Under the uploads lock, so no other upload can take this name at the same moment."""
+    with conn:
+        lock(conn, UPLOADS_LOCK)
         if path_owner(conn, path) is None:
             _remove_quietly(path)
-    finally:
-        conn.commit()
 
 
 # ---------- web service ----------
@@ -188,12 +258,15 @@ def error(status, message, **extra):
     return jsonify(error=message, **extra), status
 
 
-def create_app(data_dir=None):
-    """data_dir holds videos.db and uploads/ (default: the folder of this file)."""
+def create_app(data_dir=None, db=None):
+    """data_dir holds uploads/ (default: the folder of this file).
+    db: psycopg2.connect() arguments (default: from the DB_* environment variables).
+    Waits for the database and creates the table before it returns."""
     data_dir = os.path.abspath(data_dir or HERE)
+    settings = dict(db) if db is not None else db_settings()
     app = Flask(__name__)
     app.config.update(
-        DATABASE=os.path.join(data_dir, "videos.db"),
+        DB=settings,
         UPLOAD_FOLDER=os.path.join(data_dir, "uploads"),
         MAX_CONTENT_LENGTH=MAX_UPLOAD_MB * 1024 * 1024,
     )
@@ -203,7 +276,12 @@ def create_app(data_dir=None):
     for name in os.listdir(app.config["UPLOAD_FOLDER"]):
         if name.startswith(".upload-") and name.endswith(".part"):  # left by a crash
             os.remove(os.path.join(app.config["UPLOAD_FOLDER"], name))
-    init_db(app.config["DATABASE"])
+
+    conn = wait_for_db(settings, float(os.environ.get("DB_WAIT_SECONDS", "60")))
+    try:
+        init_db(conn)
+    finally:
+        conn.close()
     app.teardown_appcontext(close_db)
 
     @app.post("/upload")
@@ -228,20 +306,17 @@ def create_app(data_dir=None):
                 return error(400, "file is empty")
 
             conn = get_db()
-            # BEGIN IMMEDIATE takes the write lock now, so choosing the file name,
-            # moving the file and writing the row happen as one step for one upload.
-            conn.execute("BEGIN IMMEDIATE")
-            try:
+            # One transaction under the uploads lock: choosing the file name, moving the
+            # file and writing the row happen as one step for one upload, even when
+            # several Apache processes handle uploads at the same moment.
+            with conn:  # commit at the end, rollback on any error
+                lock(conn, UPLOADS_LOCK)
                 old = find_video(conn, company_name)
                 filename = choose_file_name(conn, uploads, company_name, ext)
                 file_path = os.path.join(uploads, filename)
                 replace_file(tmp_path, file_path)
                 video_url = request.host_url + "media/" + quote(filename)
                 upsert_video(conn, company_name, file_path, video_url)
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                raise
             if old is not None and old["file_path"] != file_path:
                 remove_if_unused(conn, old["file_path"])
         except FileBusyError as exc:
@@ -263,6 +338,7 @@ def create_app(data_dir=None):
 
     @app.get("/media/<filename>")  # no "/" in filename: uploads/ has no subfolders
     def media(filename):
+        # In Docker Apache serves /media/ itself (Alias), this route is for python web_service.py.
         if filename.startswith("."):  # unfinished .part uploads
             abort(404)
         mimetype = VIDEO_TYPES.get(os.path.splitext(filename)[1].lower())
@@ -272,11 +348,13 @@ def create_app(data_dir=None):
 
     @app.get("/videos")
     def videos():
-        return jsonify(videos=[dict(row) for row in list_videos(get_db())])
+        return jsonify(videos=[to_json(row) for row in list_videos(get_db())])
 
     # Errors are JSON too, so the client can show the reason.
     for code in (400, 404, 405, 413, 500):
         app.register_error_handler(code, _json_error)
+    for exc_class in (psycopg2.OperationalError, psycopg2.InterfaceError):
+        app.register_error_handler(exc_class, _db_down)
 
     return app
 
@@ -293,11 +371,17 @@ def _json_error(exc):
     return body, status
 
 
+def _db_down(exc):
+    """The database went away after start (restart of the db container, network)."""
+    log(f"database error: {exc.__class__.__name__}: {str(exc).strip()}")
+    return error(503, "database is not available, try again")
+
+
 if __name__ == "__main__":
     application = create_app()
     host = os.environ.get("FLASK_HOST", "0.0.0.0")
     port = int(os.environ.get("FLASK_PORT", "8000"))
-    print(f"Database: {application.config['DATABASE']}")
+    print(f"Database: {describe(application.config['DB'])}")
     print(f"Uploads:  {application.config['UPLOAD_FOLDER']}")
     # Development server, one thread per request. debug stays off.
     application.run(host=host, port=port, threaded=True)
