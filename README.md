@@ -2,20 +2,235 @@
 
 [![CI](https://github.com/Yarik002/csv-video-recorder/actions/workflows/ci.yml/badge.svg)](https://github.com/Yarik002/csv-video-recorder/actions/workflows/ci.yml)
 
-Two test tasks in one repository:
+One repository, three steps:
 
-- **Task 2** (latest, start here): a Flask web service with SQLite. After recording, every video is uploaded, stored, can be looked up by company name and opens in Chromium. How to run it is right below, details in [Task 2: details](#task-2-details).
-- **Task 1**: the CSV-driven browser recorder. It is unchanged; it is described in [Task 1: CSV-driven recorder](#task-1-csv-driven-recorder). The exact version I sent for Task 1 is the tag [`task-1`](https://github.com/Yarik002/csv-video-recorder/tree/task-1).
+- **Internship task 1** (latest, start here): the video web service from Task 2 now runs in Docker Compose: Apache + mod_wsgi with the Flask service in one container, PostgreSQL in another. How to run it is right below.
+- **Task 2**: the Flask web service (upload, look up by company, play) and the recorder's `--server` option, see [Task 2: video web service](#task-2-video-web-service). The version I sent for Task 2 (still on SQLite) is the tag [`task-2`](https://github.com/Yarik002/csv-video-recorder/tree/task-2).
+- **Task 1**: the CSV-driven browser recorder, see [Task 1: CSV-driven recorder](#task-1-csv-driven-recorder). The version I sent is the tag [`task-1`](https://github.com/Yarik002/csv-video-recorder/tree/task-1).
 
-## Task 2: how to run
+## Internship task 1: how to run
 
-Python 3.9 or newer. Install once.
+You need Docker with Docker Compose v2 (Docker Desktop on Windows and macOS). Nothing else: Python, Apache and PostgreSQL are inside the containers.
 
 Windows (cmd or PowerShell):
 
 ```bat
 git clone https://github.com/Yarik002/csv-video-recorder.git
 cd csv-video-recorder
+copy .env.example .env
+notepad .env
+docker compose up --build
+```
+
+Linux or macOS:
+
+```bash
+git clone https://github.com/Yarik002/csv-video-recorder.git
+cd csv-video-recorder
+cp .env.example .env
+nano .env
+docker compose up --build
+```
+
+In `.env` set your own `DB_PASSWORD`. `.env` is in `.gitignore`, so the password never gets into git; without it Compose stops with `DB_PASSWORD is not set, copy .env.example to .env`.
+
+The first build takes a few minutes (6.5 minutes on my laptop: it compiles mod_wsgi and psycopg2), later starts take about 15 seconds. Ready when the log shows:
+
+```
+db-1   | ... LOG:  database system is ready to accept connections
+web-1  | ... AH00489: Apache/2.4.68 (Debian) mod_wsgi/6.1.1 Python/3.12 configured -- resuming normal operations
+```
+
+`docker compose up --build -d --wait` does the same in the background and returns when both containers are healthy. The service is at http://localhost:8000.
+
+Check it from a second terminal (in PowerShell write `curl.exe`, plain `curl` there is another command):
+
+```bash
+curl -X POST http://localhost:8000/upload -F "company_name=ACME GmbH" -F "file=@docs/sample.webm"
+curl "http://localhost:8000/get_video_url?company_name=ACME%20GmbH"
+curl http://localhost:8000/videos
+```
+
+Answers from a real run:
+
+```
+{"company_name":"ACME GmbH","video_url":"http://localhost:8000/media/ACME_GmbH.webm"}
+{"company_name":"ACME GmbH","video_url":"http://localhost:8000/media/ACME_GmbH.webm"}
+{"videos":[{"company_name":"ACME GmbH","created_at":"2026-11-09T12:26:16.553708+00:00","file_path":"/app/uploads/ACME_GmbH.webm","id":1,"updated_at":"2026-11-09T12:26:16.553708+00:00","video_url":"http://localhost:8000/media/ACME_GmbH.webm"}]}
+```
+
+Open the `video_url` in a browser: it plays. Then stop and start again, the data stays:
+
+```bash
+docker compose down
+docker compose up -d --wait
+curl "http://localhost:8000/get_video_url?company_name=ACME%20GmbH"
+```
+
+The same check as a script (it is also what CI runs): `python scripts/docker_smoke.py upload`, then `docker compose down`, `docker compose up -d --wait`, `python scripts/docker_smoke.py check`. It needs only `requests`.
+
+Useful commands:
+
+```bash
+docker compose logs -f web                         # Apache access and error log, messages of the service
+docker compose exec web curl http://localhost/videos
+docker compose exec db psql -U video_user -d videos -c "SELECT id, company_name, video_url FROM videos"
+docker compose down -v                             # stop and DELETE the data (volumes)
+```
+
+The recorder from Task 2 works with the new server as before, only the port is the Docker one (setup of the recorder: [Task 2: how to run the recorder](#task-2-how-to-run-the-recorder)):
+
+```bash
+python capture_video.py --server http://localhost:8000
+```
+
+### Acceptance checklist
+
+Checked on Windows 11 with Docker Desktop (Docker 29.8.2, Compose 5.6.0) on 9 November 2026, and on every push in CI (job `docker`, Ubuntu 24.04).
+
+| # | Item | How it was checked |
+|---|---|---|
+| 1 | `docker compose up --build` starts both containers without errors | from empty volumes: both `healthy` in 15 s (image already built); CI builds from scratch |
+| 2 | `POST /upload` uploads a video and returns a working URL | `curl` and `scripts/docker_smoke.py`: 200, URL `http://localhost:8000/media/ACME_GmbH.webm`; the URL gives 200, `video/webm`, the bytes are identical to the upload, a Range request gives 206; it plays in Chromium |
+| 3 | `GET /get_video_url?company_name=...` returns the URL | `curl`, smoke script, `video_client.GetVideoURL` |
+| 4 | After `docker compose down` and `docker compose up` data and videos are preserved | `down` (without `-v`), `up`: the same row and a byte-identical video; smoke script `check` |
+| 5 | `web` waits for `db` and does not crash on startup | see [Waiting for the database](#waiting-for-the-database): `depends_on: service_healthy`, plus the service itself retries; tested with `db` stopped |
+
+Also checked by hand: `python capture_video.py --server http://localhost:8000` on the live DuckDuckGo, all 3 rows of `input.csv` recorded, uploaded to the Docker service and played in the preview window (the Manchester row needed two retries: DuckDuckGo did not open within 30 s on my slow network, before the service was involved). The 57 tests pass locally against `postgres:16` and in CI on Python 3.9, 3.12, 3.14.
+
+## Internship task 1: how it works
+
+```
+ browser / video_client.py / capture_video.py --server
+              |
+              | http://localhost:8000
+              v
+ +------------------- web ---------------------+        +------- db -------+
+ | Apache :80                                  |        | postgres:16      |
+ |   /media/*  -> files in /app/uploads (Alias)|  SQL   |   table videos   |
+ |   /*        -> mod_wsgi -> Flask app  ------+------->|                  |
+ +---------------------------------------------+  :5432 +------------------+
+         volume "uploads" (/app/uploads)                volume "db_data"
+```
+
+### Files
+
+| File | What it does |
+|---|---|
+| `Dockerfile` | Image of `web`: `python:3.12-slim-bookworm` + Debian Apache 2.4 + a venv with Flask, psycopg2 and mod_wsgi. Two stages: compilers stay in the first one |
+| `docker-compose.yml` | Services `web` and `db`, port `8000:80`, named volumes `db_data` and `uploads`, healthchecks, `depends_on: condition: service_healthy` |
+| `.env.example` | Template for `.env` with `DB_NAME`, `DB_USER`, `DB_PASSWORD` |
+| `apache/video-service.conf` | The Apache VirtualHost: `WSGIDaemonProcess`, `WSGIScriptAlias`, `Alias /media/` |
+| `web_service.wsgi` | Entry point for mod_wsgi: `application = create_app()` |
+| `docker/apache-foreground.sh` | Starts Apache in the foreground as the main process of the container |
+| `web_service.py` | Changed: PostgreSQL (psycopg2) instead of SQLite, settings from the environment, waits for the database |
+| `requirements.txt` | Changed: `psycopg2-binary==2.9.12` added (for the client, the tests and `python web_service.py` on your computer) |
+| `requirements-docker.txt` | New: what goes into the image, `flask==3.1.3`, `psycopg2==2.9.12`, `mod-wsgi==6.1.1` |
+| `scripts/docker_smoke.py` | Checks the running containers from outside with `video_client` |
+| `tests/db_helper.py` | PostgreSQL for the tests |
+
+### Apache and mod_wsgi
+
+mod_wsgi has to be built for the same Python that runs the app, otherwise Apache loads a module for another Python. The image has Python 3.12, and `pip install mod-wsgi` builds the module for exactly this Python (against Debian's `apache2-dev`). `mod_wsgi-express module-config` then prints the line Apache needs, it goes to `/etc/apache2/mods-available/wsgi.load`:
+
+```
+LoadModule wsgi_module "/opt/venv/lib/python3.12/site-packages/mod_wsgi/server/mod_wsgi-py312.cpython-312-x86_64-linux-gnu.so"
+WSGIPythonHome "/opt/venv"
+```
+
+The system package `libapache2-mod-wsgi-py3` would be built for Debian's own Python 3.11, not for the 3.12 of the image, so I did not use it.
+
+The VirtualHost (`apache/video-service.conf`):
+- `WSGIDaemonProcess video-service processes=2 threads=15`: the Flask app runs in 2 separate processes with 15 threads each, as user `www-data`, not inside the Apache workers.
+- `WSGIScriptAlias / /app/web_service.wsgi process-group=... application-group=...`: with both options mod_wsgi loads the app when the process starts, not on the first request. So the app connects to the database and creates the table before it answers anything.
+- `Alias /media/ /app/uploads/`: Apache sends the videos itself (Range requests, no Python in between), as the task suggests for production. Files starting with a dot (unfinished uploads) are denied, directory listing is off. The Flask route `/media/<filename>` stays for running without Docker.
+- Both logs go to the container output: `docker compose logs web`. Healthcheck requests are not logged.
+
+### SQLite to PostgreSQL
+
+| | Task 2 (SQLite) | Now (PostgreSQL) |
+|---|---|---|
+| Connection | `sqlite3.connect("videos.db")` | `psycopg2.connect(host, port, dbname, user, password)` from `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` |
+| Placeholders | `?` | `%s` |
+| Id | `INTEGER PRIMARY KEY AUTOINCREMENT` | `INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY` |
+| Time | `TEXT DEFAULT (datetime('now'))` | `TIMESTAMPTZ DEFAULT NOW()`, in JSON as ISO 8601 (`2026-11-09T12:26:16.553708+00:00`) |
+| Upsert | `ON CONFLICT(company_name) DO UPDATE` | the same, `UNIQUE` on `company_name` stays |
+| Rows as dicts | `sqlite3.Row` | `RealDictCursor` |
+| Per request | connection in `flask.g` | the same: a new connection per request, closed in `teardown_appcontext` |
+| One upload at a time | `BEGIN IMMEDIATE` (SQLite write lock) | `pg_advisory_xact_lock` (see below) |
+| Case-insensitive file check | `COLLATE NOCASE` | `lower(file_path) = lower(%s)` |
+
+The table:
+
+```sql
+CREATE TABLE IF NOT EXISTS videos (
+    id           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    company_name TEXT        NOT NULL UNIQUE,
+    file_path    TEXT        NOT NULL,  -- absolute path to the file on disk
+    video_url    TEXT        NOT NULL,  -- public URL to the video
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+```
+
+### Waiting for the database
+
+Two layers, because one is not enough:
+1. **Compose.** `web` has `depends_on: db: condition: service_healthy`, and the `db` healthcheck is `pg_isready -h 127.0.0.1 ...`. The `-h 127.0.0.1` matters: on the very first start the postgres image runs a temporary server on a Unix socket only, while it creates the database, then restarts it. I polled both variants every 50 ms during a first start: the socket check said "ready" on the temporary server about 1.3 s before the real one was up, the TCP check waited for the real one.
+2. **The service.** `create_app()` connects with retries once a second for up to `DB_WAIT_SECONDS` (60) and logs every attempt. This was needed for real: after Docker Desktop restarted, both containers were started at the same moment by `restart: unless-stopped` (then `depends_on` does not apply), and the log shows `waiting for the database ... (attempt 1..4): the database system is starting up`, then `database is ready after 5 attempts`.
+
+What I tried by hand: `db` stopped, `web` restarted: the service logs the attempts, requests wait, and as soon as `db` is started the requests are answered. If `db` stays away longer than 60 s, the service logs `RuntimeError: database video_user@db:5432/videos is not ready after 60 s: could not translate host name "db" ...`, Apache keeps running and the container is not restarted in a loop; the next request tries again, and after `db` came back it got 200. If the database goes away while the service is running, requests get `503 {"error": "database is not available, try again"}` instead of a 500 (checked by a test).
+
+### Decisions worth knowing
+
+- **Advisory locks instead of `BEGIN IMMEDIATE`.** Choosing the file name, moving the file and writing the row must be one step, also across the 2 Apache processes. `SELECT pg_advisory_xact_lock(key)` takes a lock in PostgreSQL that every process sees and that ends with the transaction. The same for `CREATE TABLE IF NOT EXISTS`: two processes start at once, and without a lock PostgreSQL can fail with `duplicate key value violates unique constraint "pg_class_relname_nsp_index"`. I removed each lock for a moment and ran the tests: both tests failed, with the locks they pass.
+- **Secrets.** The password is only in `.env` (not in git). Compose passes it to both containers. The CI job generates a random one.
+- **No database port on the host.** `db` has no `ports`, only `web` reaches it inside the Compose network by the name `db`.
+- **psycopg2 in two forms.** In the image it is built from source against `libpq` (`psycopg2`), as the psycopg2 docs recommend for production. On your computer `psycopg2-binary` installs without a compiler, also on Windows. Version 2.9.12, the last with Python 3.9 wheels.
+- **Graceful stop.** `STOPSIGNAL SIGWINCH`: on `docker compose down` Apache finishes the requests in progress (an upload) and exits.
+- **Restarts.** Both services have `restart: unless-stopped`.
+
+### Limits
+
+- `/media/` is now served by Apache, so a missing video gives Apache's HTML 404, not the JSON 404 of Flask. The JSON API endpoints are unchanged.
+- The image is 358 MB (Python 3.12 slim + Apache).
+- There is no HTTPS and no login: the task does not ask for them. In production the password would go into Docker secrets rather than an environment variable.
+- `.env` lives next to `docker-compose.yml`; `docker compose` must be run from this folder.
+
+### Tests and CI
+
+Tests need a PostgreSQL. Locally I start a throwaway one in Docker on port 5433 (the test database name must end with `_test`, the tests drop the table):
+
+```bash
+docker run -d --name videos-test-db -p 127.0.0.1:5433:5432 -e POSTGRES_DB=videos_test -e POSTGRES_USER=video_user -e POSTGRES_PASSWORD=test_only postgres:16
+```
+
+Then, in the venv (see [Task 2: how to run the recorder](#task-2-how-to-run-the-recorder)), PowerShell:
+
+```powershell
+$env:DB_HOST="127.0.0.1"; $env:DB_PORT="5433"; $env:DB_NAME="videos_test"; $env:DB_USER="video_user"; $env:DB_PASSWORD="test_only"
+python -m unittest discover -s tests -v
+```
+
+Linux/macOS: `DB_HOST=127.0.0.1 DB_PORT=5433 DB_NAME=videos_test DB_USER=video_user DB_PASSWORD=test_only python -m unittest discover -s tests -v`.
+
+Without these variables the database tests are skipped with the reason. 57 tests, about 2 minutes, new for this task: the exact PostgreSQL schema (identity key, `UNIQUE`, `timestamptz`, no `bytea`), 8 processes creating the table at once (5 rounds), restart keeps the data, settings only from the environment and no password in errors, waiting for the database (retries, clear error after the timeout), 503 when the database is down, and all Task 2 tests (20 parallel uploads now check the advisory lock).
+
+CI (`.github/workflows/ci.yml`) has two jobs:
+- `test`: the tests on Python 3.9, 3.12, 3.14 with `postgres:16` as a GitHub Actions service; `REQUIRE_DB=1` makes them fail instead of skip if the database is missing.
+- `docker`: `.env` with a random password, `docker compose up --build --wait`, `scripts/docker_smoke.py upload`, `docker compose down`, `up`, `scripts/docker_smoke.py check`, logs.
+
+## Task 2: video web service
+
+The service from Task 2. Since Internship task 1 it uses PostgreSQL; the SQLite version is the tag [`task-2`](https://github.com/Yarik002/csv-video-recorder/tree/task-2).
+
+### Task 2: how to run the recorder
+
+Python 3.9 or newer. Install once.
+
+Windows (cmd or PowerShell):
+
+```bat
 py -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -27,46 +242,29 @@ If PowerShell says that running scripts is disabled, run `Set-ExecutionPolicy -S
 Linux or macOS:
 
 ```bash
-git clone https://github.com/Yarik002/csv-video-recorder.git
-cd csv-video-recorder
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python -m playwright install --with-deps chromium
 ```
 
-Then two terminals, both in the `csv-video-recorder` folder with the venv activated (`.venv\Scripts\activate` on Windows, `source .venv/bin/activate` on Linux/macOS).
-
-Terminal 1, the web service:
-
-```bash
-python web_service.py
-```
-
-```
-Database: C:\...\csv-video-recorder\videos.db
-Uploads:  C:\...\csv-video-recorder\uploads
- * Running on all addresses (0.0.0.0)
- * Running on http://127.0.0.1:8000
-```
+Terminal 1, the service: `docker compose up --build` (see above). Without Docker, `python web_service.py` runs the same app on the Flask dev server at `0.0.0.0:8000` (`FLASK_HOST`, `FLASK_PORT`), but it needs a PostgreSQL and the `DB_*` variables.
 
 Terminal 2, record the 3 rows of `input.csv`, upload each video and open it in Chromium:
 
 ```bash
-python capture_video.py --server http://127.0.0.1:8000
+python capture_video.py --server http://localhost:8000
 ```
+
+Output of a real run against the Docker service (9 November 2026):
 
 ```
 [1/3] Acme Retail GmbH (Berlin)
-  saved: C:\...\csv-video-recorder\video\Acme Retail GmbH.webm (34 s)
-  uploaded: http://127.0.0.1:8000/media/Acme_Retail_GmbH.webm
+  saved: C:\...\csv-video-recorder\video\Acme Retail GmbH.webm (54 s)
+  uploaded: http://localhost:8000/media/Acme_Retail_GmbH.webm
 [2/3] Nordic Home; Garden AB (Stockholm)
-  saved: C:\...\csv-video-recorder\video\Nordic Home; Garden AB.webm (34 s)
-  uploaded: http://127.0.0.1:8000/media/Nordic_Home_Garden_AB.webm
-[3/3] Atlantic Supplies Ltd (Manchester)
-  saved: C:\...\csv-video-recorder\video\Atlantic Supplies Ltd.webm (33 s)
-  uploaded: http://127.0.0.1:8000/media/Atlantic_Supplies_Ltd.webm
-Done: 3 of 3 videos saved, 3 uploaded, 3 previewed.
+  saved: C:\...\csv-video-recorder\video\Nordic Home; Garden AB.webm (38 s)
+  uploaded: http://localhost:8000/media/Nordic_Home_Garden_AB.webm
 ```
 
 The recorder needs a visible browser window: DuckDuckGo answers headless browsers with an error page (see [Headless](#headless)).
@@ -74,63 +272,6 @@ The recorder needs a visible browser window: DuckDuckGo answers headless browser
 After each upload a Chromium window opens the returned URL and its built-in player plays the video for 10 seconds (`--view-seconds N`; `--view-seconds 0` keeps it open until you press Enter):
 
 ![The preview window: Chromium plays the uploaded video from the service](docs/img/preview.png)
-
-Notes:
-- The service listens on `0.0.0.0:8000`. On the first start Windows may ask whether Python may use the network: allow it, or keep the service local with `FLASK_HOST=127.0.0.1`.
-- `FLASK_HOST` and `FLASK_PORT` change the address: `set FLASK_PORT=8080` (cmd), `$env:FLASK_PORT="8080"` (PowerShell), `FLASK_PORT=8080 python web_service.py` (Linux/macOS).
-
-Ask the service yourself (in PowerShell write `curl.exe`, plain `curl` there is another command):
-
-```bash
-curl "http://127.0.0.1:8000/get_video_url?company_name=Acme%20Retail%20GmbH"
-curl -X POST http://127.0.0.1:8000/upload -F "company_name=ACME GmbH" -F "file=@docs/sample.webm"
-curl http://127.0.0.1:8000/videos
-```
-
-Answers:
-
-```
-{"company_name":"Acme Retail GmbH","video_url":"http://127.0.0.1:8000/media/Acme_Retail_GmbH.webm"}
-{"company_name":"ACME GmbH","video_url":"http://127.0.0.1:8000/media/ACME_GmbH.webm"}
-{"videos":[{"company_name":"ACME GmbH","created_at":"2026-11-06 11:10:50","file_path":"C:\\...\\uploads\\ACME_GmbH.webm","id":10,"updated_at":"2026-11-06 11:10:50","video_url":"http://127.0.0.1:8000/media/ACME_GmbH.webm"}, ...]}
-```
-
-Tests, offline, about 2 minutes, they open Chromium windows (on Linux without a screen run them with `xvfb-run`):
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-### Acceptance checklist
-
-Every item was checked by hand on Windows 11 on 6 November 2026 against the live DuckDuckGo, and most of them also by an automated test that runs in CI on Python 3.9, 3.12 and 3.14.
-
-| # | Item | Automated test | By hand |
-|---|---|---|---|
-| 1 | `pip install -r requirements.txt` works on a clean machine | CI installs into a fresh Ubuntu on 3.9, 3.12, 3.14 | fresh clone from GitHub into an empty folder, new venv on Python 3.14 and on 3.11 |
-| 2 | `python web_service.py` starts and creates `videos.db` and `uploads/` | `RunAsScriptTest` (real `python web_service.py`), `StartupTest` (exact schema, WAL) | yes, both appeared on start |
-| 3 | `POST /upload` returns 200 and a working URL | `UploadTest`, `ClientTest` | 3 recorded videos + curl |
-| 4 | The URL serves the file (HTTP 200) and plays in a browser | `MediaTest` (200, `video/webm`, Range gives 206), `test_preview_opens_the_url` | Chromium played it, screenshot above (0:05 of 0:31, not paused) |
-| 5 | `GET /get_video_url` returns the URL; 404 for unknown names | `LookupAndListTest`, `test_unknown_company` | 3 companies 200, made-up name 404 |
-| 6 | The DB stores `company_name`, `file_path`, `video_url` | `test_upload_returns_url_and_saves_file` (absolute path, no BLOB column) | printed the table |
-| 7 | Re-upload of the same company updates the record, no duplicates | `test_reupload_updates_same_row`, 20 parallel uploads | second batch run: still 3 rows, same `id` and `created_at`, new `updated_at` |
-| 8 | `capture_video.py --server http://127.0.0.1:8000` uploads each video and opens it in Chromium | `EndToEndTest` (local copy of the search page), `BatchLoopTest` | 3 of 3 uploaded and previewed |
-| 9 | Works end to end on a clean machine after `pip install` and `playwright install chromium` | CI | fresh clone, Python 3.14, steps above: 50 tests pass, live run 3 of 3 uploaded and previewed |
-
-Also checked by hand: with the service stopped, the batch still records all 3 videos, logs `upload failed: cannot reach http://127.0.0.1:8000/upload: ConnectionError` for each and exits with code 1; `--view-seconds 0` keeps the window until Enter.
-
-## Task 2: details
-
-### Files
-
-| File | What it does |
-|---|---|
-| `web_service.py` | New. The Flask service and the database layer (`create_app`, `init_db`, `get_db`, `upsert_video`, `find_video`, `list_videos`) |
-| `video_client.py` | New. `UploadVideo(server_url, video_path, company_name) -> str` and `GetVideoURL(server_url, company_name) -> str` with the exact signatures, plus `PreviewVideo(video_url, view_seconds)` |
-| `capture_video.py` | Changed. `--server URL` and `--view-seconds N`. Without `--server` it works and prints exactly as in Task 1 |
-| `requirements.txt` | Changed. `playwright==1.60.0`, `flask==3.1.3`, `requests==2.32.5` |
-| `qscript.py` | Not changed (Task 1) |
-| `tests/test_web_service.py`, `tests/test_upload_preview.py` | New tests for Task 2 |
 
 ### Endpoints
 
@@ -141,68 +282,40 @@ Also checked by hand: with the service stopped, the batch still records all 3 vi
 | `GET /media/<filename>` | the video file, `Content-Type: video/webm`, Range requests answered with 206, so the player can seek |
 | `GET /videos` | `{"videos": [{id, company_name, file_path, video_url, created_at, updated_at}, ...]}`, sorted by name |
 
-Every error is JSON with an `error` field: 400 for a missing or empty `file`, a missing or blank `company_name`, an extension that is not `.webm`, `.mp4`, `.ogv` or `.ogg` (a file without an extension is taken as `.webm`); 404; 405 for a wrong method; 413 for a file over 500 MB; 503 if the file is being read at that moment (see below). Spaces around `company_name` are removed.
+Every error of the API is JSON with an `error` field: 400 for a missing or empty `file`, a missing or blank `company_name`, an extension that is not `.webm`, `.mp4`, `.ogv` or `.ogg` (a file without an extension is taken as `.webm`); 404; 405 for a wrong method; 413 for a file over 500 MB; 503 if the database is not available, or (on Windows without Docker) if the file is being read at that moment. Spaces around `company_name` are removed.
 
-### Database
+### Files of Task 2
 
-`videos.db` next to `web_service.py`, created on start with exactly the table from the task:
+| File | What it does |
+|---|---|
+| `web_service.py` | The Flask service and the database layer (`create_app`, `init_db`, `get_db`, `upsert_video`, `find_video`, `list_videos`) |
+| `video_client.py` | `UploadVideo(server_url, video_path, company_name) -> str` and `GetVideoURL(server_url, company_name) -> str` with the exact signatures, plus `PreviewVideo(video_url, view_seconds)` |
+| `capture_video.py` | `--server URL` and `--view-seconds N`. Without `--server` it works and prints exactly as in Task 1 |
+| `qscript.py` | Not changed (Task 1) |
+| `tests/test_web_service.py`, `tests/test_upload_preview.py` | Tests for the service and the client |
 
-```sql
-CREATE TABLE IF NOT EXISTS videos (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    company_name TEXT    NOT NULL UNIQUE,
-    file_path    TEXT    NOT NULL,  -- absolute path to the file on disk
-    video_url    TEXT    NOT NULL,  -- public URL to the video
-    created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
-    updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-```
+### How the hints of Task 2 are done
 
-Only the path and the URL are stored, the video itself is in `uploads/`. `datetime('now')` in SQLite is UTC. Re-upload is one statement:
-
-```sql
-INSERT INTO videos (company_name, file_path, video_url) VALUES (?, ?, ?)
-ON CONFLICT(company_name) DO UPDATE SET
-    file_path = excluded.file_path, video_url = excluded.video_url, updated_at = datetime('now')
-```
-
-so the row keeps its `id` and `created_at`.
-
-### How the hints from the task are done
-
-- **Connection per request.** `get_db()` opens a connection and keeps it in `flask.g`; `teardown_appcontext` closes it. No connection is shared between threads.
-- **"database is locked".** `sqlite3.connect(timeout=10)` plus `PRAGMA busy_timeout = 10000`: a second writer waits instead of failing. `PRAGMA journal_mode = WAL` is set once in `init_db` (it is stored in the file): readers do not block the writer. A test sends 20 uploads at the same moment to a real threaded server: all 200, no "locked".
-- **URL from `request.host_url`.** `video_url = request.host_url + "media/" + <file name>`. A request to `http://127.0.0.1:8000` gives `http://127.0.0.1:8000/media/...`, a request from another computer to `http://192.168.1.5:8000` gives that address.
-- **`send_from_directory`** serves `uploads/`. It refuses paths outside the folder (`/media/../videos.db` is 404, tested) and answers Range requests.
-- **Path and URL in the DB, not bytes.** Tested: no BLOB column, the file on disk is byte-identical to the upload.
+- **Connection per request** in `flask.g`, closed in `teardown_appcontext`. No connection is shared between threads.
+- **URL from `request.host_url`.** A request to `http://localhost:8000` gives `http://localhost:8000/media/...`, a request from another computer to `http://192.168.1.5:8000` gives that address. Behind Apache this works the same, Apache passes the `Host` header.
+- **`send_from_directory`** serves `uploads/` without Docker (refuses paths outside the folder, answers Range requests); in Docker Apache does it.
+- **Path and URL in the DB, not bytes.** Tested: no binary column, the file on disk is byte-identical to the upload.
 - **Multipart from the client.** `requests` with `files={"file": (filename, fileobj, "video/webm")}, data={"company_name": ...}`.
 - **Direct `.webm` URL in Chromium** shows its built-in player; `PreviewVideo` launches Chromium with `headless=False` and goes to the URL.
-- **Lazy import.** `capture_video.py` imports `video_client` only when `--server` is given, and `video_client` imports `requests` and Playwright inside the functions. A test runs the recorder with `requests` blocked: without `--server` it works, with `--server` it says `--server needs the requests package`.
+- **Lazy import.** `capture_video.py` imports `video_client` only when `--server` is given, and `video_client` imports `requests` and Playwright inside the functions.
 
-### Decisions worth knowing
+### Decisions of Task 2
 
-- **File names.** `ACME GmbH` becomes `ACME_GmbH.webm`, as in the task: every character except `A-Z a-z 0-9 . _ -` becomes `_`. This is my own small rule, not `werkzeug.utils.secure_filename`: werkzeug comes only as a dependency of Flask, and the task lists flask, requests and playwright as the allowed libraries. Different companies can give the same name (`A B` and `A_B`; `acme` and `ACME` on Windows, where file names ignore case), so before saving the service checks in the database whether another company already uses this file; if so, it adds the first 8 characters of the SHA-1 of the company name (`A_B_2429e5cb.webm`). Names with no Latin letters or digits (`ООО Ромашка`) and Windows device names (`CON`) get `video_<hash>`.
-- **Atomic save.** The upload is written to a temporary `.part` file in `uploads/`, then moved over the old file with `os.replace`, so a player never gets half a file. Choosing the name, moving the file and writing the row run under one write lock (`BEGIN IMMEDIATE`), so two parallel uploads cannot pick the same name.
-- **A file that is being played.** On Windows a file that is open cannot be replaced. I checked it: while a client was downloading `Enter_Check_Co.webm`, a re-upload of that company got `503 {"error": "... is being read right now ..."}` after 5 tries in 0.8 s; after the download was closed, the same upload returned 200.
-- **Errors in the batch.** A failed upload prints `upload failed: <reason>`, a failed preview prints `preview failed: <reason>`, and the loop goes on with the next row. The last line counts saved, uploaded and previewed videos; the exit code is 1 if any of them failed.
-- **`--view-seconds`** default is 10. A negative value or `--view-seconds` without `--server` is an argument error. If you close the preview window yourself before the time is up, the batch just goes on.
-- **Development server.** `app.run(threaded=True)`, debug off, as the task asks.
+- **File names.** `ACME GmbH` becomes `ACME_GmbH.webm`: every character except `A-Z a-z 0-9 . _ -` becomes `_` (my own small rule, not `werkzeug.utils.secure_filename`: Task 2 allowed only flask, requests and playwright). Different companies can give the same name (`A B` and `A_B`; `acme` and `ACME` on Windows), so the service checks in the database whether another company already uses this file and then adds the first 8 characters of the SHA-1 of the company name (`A_B_2429e5cb.webm`). Names with no Latin letters or digits (`ООО Ромашка`) and Windows device names (`CON`) get `video_<hash>`.
+- **Atomic save.** The upload is written to a temporary `.part` file in `uploads/`, then moved over the old file with `os.replace`, so a player never gets half a file.
+- **A file that is being played (Windows, without Docker).** An open file cannot be replaced there; the service retries for 0.8 s, then answers 503.
+- **Errors in the batch.** A failed upload prints `upload failed: <reason>`, a failed preview prints `preview failed: <reason>`, and the loop goes on with the next row. The exit code is 1 if any of them failed.
 
-### Limits
+### Limits of Task 2
 
 - The URL is saved at upload time, as the schema says. If the service is later opened under another address, old rows keep the old host until the video is uploaded again.
-- `0.0.0.0` is the address the service listens on, not an address to open: use `127.0.0.1` on the same computer or the computer's IP from another one.
-- The host in `video_url` comes from the request, as the task says, so a client decides which host is saved. `/videos` shows absolute paths on the server. Fine for a local tool, not for the open internet.
-- `ON CONFLICT ... DO UPDATE` needs SQLite 3.24 (2018) or newer. Python on Windows, macOS and current Linux has it (3.45 here, also in CI).
-- There is no login, no delete endpoint and no HTML page: the task does not ask for them. For real use I would put it behind gunicorn and nginx and keep the files in object storage.
-
-### Tests for Task 2
-
-`tests/test_web_service.py` (27 tests, about 6 s): `python web_service.py` with `FLASK_HOST`/`FLASK_PORT` keeps `videos.db` and `uploads/` next to the script, not in the current folder; schema and WAL; upload JSON, file and row; re-upload keeps one row, `id` and `created_at`; a new extension removes the old file; name collisions (`A B`/`A_B`, `acme`/`ACME`), Cyrillic and `CON`; every 400/404/405/413/503 is JSON and stores nothing; `/media` 200, Range 206, path traversal 404; 20 parallel uploads on a real threaded server, also with colliding names.
-
-`tests/test_upload_preview.py` (13 tests): exact client signatures; `UploadVideo` and `GetVideoURL` against a running service; `VideoNotFoundError` for an unknown name; a clear error when the service is down; the preview window really requests the video; `--view-seconds 0` waits for Enter; a failed upload or preview does not stop the loop; lazy import; end to end: record on the local copy of the search page, upload, preview.
-
-The preview needs a screen, so CI runs the tests with `xvfb-run`.
+- The host in `video_url` comes from the request, as the task says, so a client decides which host is saved. `/videos` shows absolute paths on the server. Fine for an internal tool, not for the open internet.
+- There is no login, no delete endpoint and no HTML page: the task does not ask for them.
 
 ## Task 1: CSV-driven recorder
 
@@ -254,7 +367,7 @@ python capture_video.py --headless                   # no window (DuckDuckGo blo
 | `qscript.py` | `CaptureVideo_Magento(...)` with the exact signature, the global `PATH_TO_VIDEO_FOLDER = "./video"`, the sample behaviour, the injected cursor/highlight/ripple/callout and the `ShowCallout` helper |
 | `capture_video.py` | Reads the CSV with `csv.DictReader(f, delimiter=";", quotechar='"')` and calls the function for every row, prints the saved path. Exit code 1 if any row failed |
 | `input.csv` | Sample input, 3 rows. The second company name contains `;` inside quotes to show the quote handling |
-| `requirements.txt` | `playwright` (Task 2 added `flask` and `requests`) |
+| `requirements.txt` | `playwright` (Task 2 added `flask` and `requests`, Internship task 1 `psycopg2-binary`) |
 | `tests/` | Offline tests on a local copy of the search flow, run in CI on Python 3.9, 3.12 and 3.14 |
 | `docs/NOTES.md` | Problems I ran into and how I solved them |
 
