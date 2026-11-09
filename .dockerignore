@@ -1,0 +1,12 @@
+# Only what the Dockerfile copies is needed; keep secrets and local data out of the build.
+.git
+.github
+.venv
+.env
+__pycache__
+*.pyc
+video/
+uploads/
+videos.db*
+docs/
+tests/

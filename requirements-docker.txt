@@ -1,0 +1,7 @@
+# Packages inside the Docker image of the web service (see Dockerfile, Python 3.12 there).
+# For running the recorder, the client and the tests on your computer use requirements.txt.
+flask==3.1.3
+# PostgreSQL driver, built from source against libpq in the image.
+psycopg2==2.9.12
+# Built with pip for the image's Python, so the Apache module always matches it.
+mod-wsgi==6.1.1
