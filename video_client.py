@@ -5,6 +5,7 @@ module needs nothing, and the recorder works without requests when --server
 is not used.
 """
 
+import contextlib
 import os
 
 MIME_TYPES = {".webm": "video/webm", ".mp4": "video/mp4", ".ogv": "video/ogg", ".ogg": "video/ogg"}
@@ -38,11 +39,18 @@ def UploadVideo(server_url: str, video_path: str, company_name: str) -> str:
     """Uploads a video file to the server and returns its URL."""
     filename = os.path.basename(video_path)
     mime = MIME_TYPES.get(os.path.splitext(filename)[1].lower(), "application/octet-stream")
-    with open(video_path, "rb") as f:
+    # Internship task 2: the zoom events next to the video go with it, the server
+    # then renders the zoomed version in the background.
+    sidecar = os.path.splitext(video_path)[0] + ".zoom.json"
+    with contextlib.ExitStack() as stack:
+        files = {"file": (filename, stack.enter_context(open(video_path, "rb")), mime)}
+        if os.path.isfile(sidecar):
+            files["zoom"] = (os.path.basename(sidecar), stack.enter_context(open(sidecar, "rb")),
+                             "application/json")
         resp = _call(
             "POST",
             server_url.rstrip("/") + "/upload",
-            files={"file": (filename, f, mime)},
+            files=files,
             data={"company_name": company_name},
             timeout=(5, 300),  # connect, read
         )

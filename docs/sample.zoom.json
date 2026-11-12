@@ -1,0 +1,12 @@
+{
+  "viewport": {"width": 1280, "height": 720},
+  "fps": 25,
+  "zoom_factor": 2.0,
+  "ramp_sec": 0.5,
+  "events": [
+    {"t": 9.5, "x": 480, "y": 60, "type": "in"},
+    {"t": 15.0, "x": 480, "y": 60, "type": "out"},
+    {"t": 25.5, "x": 340, "y": 212, "type": "in"},
+    {"t": 28.5, "x": 340, "y": 212, "type": "out"}
+  ]
+}

@@ -41,9 +41,12 @@ jobs:
         run: |
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
-      - name: Offline tests (local search copy, web service on PostgreSQL, upload + preview)
+          # ffmpeg for the zoom render tests (Internship task 2); without it they are skipped
+          sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Offline tests (local search copy, web service on PostgreSQL, upload + preview, zoom)
         # The preview opens Chromium with a window (headless=False), xvfb gives it a screen.
-        run: xvfb-run -a python -m unittest discover -s tests -v
+        # pytest also runs the older unittest classes.
+        run: xvfb-run -a python -m pytest tests -v
 
   docker:
     # Internship task 1: build the image, start web + db with Compose, check from outside.
@@ -61,13 +64,17 @@ jobs:
           sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=$(openssl rand -hex 16)/" .env
       - name: docker compose up --build
         run: docker compose up --build -d --wait --wait-timeout 180
-      - name: Upload, URL, lookup
+      - name: ffmpeg is in the image (Internship task 2)
+        run: |
+          docker compose exec -T web ffmpeg -hide_banner -version
+          docker compose exec -T worker ffmpeg -hide_banner -filters | grep zoompan
+      - name: Upload, URL, lookup, zoom rendered by the worker
         run: python scripts/docker_smoke.py upload
       - name: docker compose down, then up again
         run: |
           docker compose down
           docker compose up -d --wait --wait-timeout 120
-      - name: Data and video are still there
+      - name: Data, video and zoomed video are still there
         run: python scripts/docker_smoke.py check
       - name: Logs
         if: always()

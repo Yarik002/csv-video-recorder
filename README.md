@@ -2,11 +2,121 @@
 
 [![CI](https://github.com/Yarik002/csv-video-recorder/actions/workflows/ci.yml/badge.svg)](https://github.com/Yarik002/csv-video-recorder/actions/workflows/ci.yml)
 
-One repository, three steps:
+One repository, four steps:
 
-- **Internship task 1** (latest, start here): the video web service from Task 2 now runs in Docker Compose: Apache + mod_wsgi with the Flask service in one container, PostgreSQL in another. How to run it is right below.
+- **Internship task 2** (latest, start here): Camtasia-style zoom. F5 (or `window.__zoomAt(x, y)` from the scenario) marks a zoom at the mouse point while recording, the events go to `<video>.zoom.json`, `apply_zoom.py` renders a smooth zoom with ffmpeg `zoompan`, and in Docker a `worker` container does it for every uploaded video and stores the result URL in PostgreSQL. How to run it is right below.
+- **Internship task 1**: the video web service runs in Docker Compose: Apache + mod_wsgi with the Flask service in one container, PostgreSQL in another, see [Internship task 1: how to run](#internship-task-1-how-to-run). The version I sent is the tag [`internship-1`](https://github.com/Yarik002/csv-video-recorder/tree/internship-1).
 - **Task 2**: the Flask web service (upload, look up by company, play) and the recorder's `--server` option, see [Task 2: video web service](#task-2-video-web-service). The version I sent for Task 2 (still on SQLite) is the tag [`task-2`](https://github.com/Yarik002/csv-video-recorder/tree/task-2).
 - **Task 1**: the CSV-driven browser recorder, see [Task 1: CSV-driven recorder](#task-1-csv-driven-recorder). The version I sent is the tag [`task-1`](https://github.com/Yarik002/csv-video-recorder/tree/task-1).
+
+## Internship task 2: how to run
+
+### 1. The Docker stack (web + worker + db)
+
+Same as Internship task 1, now with a third container `worker` (same image, ffmpeg inside). Windows:
+
+```bat
+git clone https://github.com/Yarik002/csv-video-recorder.git
+cd csv-video-recorder
+copy .env.example .env
+notepad .env
+docker compose up --build -d --wait
+```
+
+(Linux/macOS: `cp .env.example .env`, `nano .env`.) Set your own `DB_PASSWORD` in `.env`. An existing database volume from task 1 is upgraded on start (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, `CREATE TABLE IF NOT EXISTS jobs`).
+
+Upload a video together with its zoom events (PowerShell: `curl.exe`):
+
+```bash
+curl -X POST http://localhost:8000/upload -F "company_name=ACME GmbH" -F "file=@docs/sample.webm" -F "zoom=@docs/sample.zoom.json"
+curl http://localhost:8000/jobs/1
+```
+
+Answers from a real run (the second one after about 40 s, the worker needs about as long as the video):
+
+```
+{"company_name":"ACME GmbH","job_id":1,"job_url":"http://localhost:8000/jobs/1","video_url":"http://localhost:8000/media/ACME_GmbH.webm"}
+{"company_name":"ACME GmbH","error":null,"finished_at":"2026-11-12T20:59:20.322859+00:00","id":1,"processed_video_url":"http://localhost:8000/media/zoomed/ACME_GmbH-job1.webm","started_at":"2026-11-12T20:58:41.361573+00:00","status":"done","video_id":5,"zoom":{...}}
+```
+
+Open `processed_video_url` in a browser: the zoomed video. `docker compose logs -f worker` shows the jobs. `GET /videos` has `processed_video_url` for every company.
+
+### 2. Recording with zoom (on your computer)
+
+Setup of the recorder as in [Task 2: how to run the recorder](#task-2-how-to-run-the-recorder) (venv, `pip install -r requirements.txt`, `python -m playwright install chromium`). Then:
+
+```bash
+python capture_video.py --zoom --server http://localhost:8000
+```
+
+- `--zoom`: the sample scenario zooms in on the search box while it types the query (`window.__zoomAt(x, y)`, the automation does not press F5).
+- **F5** during any recording toggles the zoom by hand: the first press starts the zoom-in at the mouse, the second starts the zoom-out. A green ring shows "zoom in", a red ring "zoom out". The page is not reloaded.
+- After each video with at least one event, `video/<Company>.zoom.json` is written next to it, and `--server` uploads it with the video. The worker renders it, `GET /videos` shows the result.
+
+### 3. apply_zoom.py by hand
+
+```bash
+python apply_zoom.py --video video/ACME_GmbH.webm             # -> video/ACME_GmbH.zoomed.webm
+python apply_zoom.py --video video/ACME_GmbH.webm --dry-run   # print the ffmpeg command only
+python apply_zoom.py --video video/ACME_GmbH.webm --ffmpeg C:\ffmpeg\bin\ffmpeg.exe
+```
+
+It needs an ffmpeg with `zoompan` and `libvpx-vp9` (the one Playwright downloads has neither). If you have no ffmpeg on Windows, run it in the container, the `video` folder mounted:
+
+```bash
+docker compose run --rm -v "%cd%/video:/video" worker /opt/venv/bin/python /app/apply_zoom.py --video /video/ACME_GmbH.webm
+```
+
+(Linux/macOS: `"$(pwd)/video:/video"`.)
+
+### Acceptance checklist
+
+Checked on Windows 11 with Docker Desktop on 12-13 November 2026, and in CI.
+
+| # | Item | How it was checked |
+|---|---|---|
+| 1 | The first F5 marks the start of the zoom-in, the second the start of the zoom-out | test with Playwright's F5 (`tests/test_zoom_capture.py`), and a real F5 from Windows (`keybd_event`) in a headed Chromium: two events `in`/`out` at the exact mouse position, the page was not reloaded |
+| 2 | `window.__zoomAt(x, y)` toggles in/out from the scenario | tests; `capture_video.py --zoom` on the live DuckDuckGo, 3 of 3 videos with an in/out pair around the typed query |
+| 3 | `<video>.zoom.json` is written only when there is at least one event | tests: no events, no file (and an old file of the same company is removed); the existing recorder test still sees only `.webm` files |
+| 4 | `python apply_zoom.py --video ...` produces a zoomed `.webm` | tests with ffmpeg (VP9, same 1280x720); by hand in the container on a live recording |
+| 5 | `--dry-run` prints the ffmpeg command without encoding | test: works even with a non-existent `--ffmpeg`, no file is created |
+| 6 | An open-ended zoom holds to the end | tests: the math, and a real render where the last frame is still zoomed |
+| 7 | The zoom centres on the exact mouse point and stays within the frame | real render of a red square at (900, 200): in the hold it is at (640, 360) and twice as big; near a corner the crop sticks to the edges |
+| 8 | Smooth (ease-in, hold, ease-out), several pairs | tests: smoothstep ramp frame by frame, 2 pairs, overlapping pairs moved; frames of real renders looked at by eye |
+| 9 | Post-processing runs in the Docker stack and stores the result in PostgreSQL | `curl` upload with `zoom=@docs/sample.zoom.json`, the `worker` container rendered it, `jobs` and `videos.processed_video_url` filled, Apache serves the file (200 `video/webm`, Range 206); live run: 3 recordings rendered by the worker; CI job `docker` does the same and checks it after `down`/`up` |
+| 10 | Tests pass locally and in CI | `python -m pytest tests`: 112 passed, 5 skipped (the ffmpeg tests: no ffmpeg on my Windows, they passed in a container with ffmpeg, 39 of 39 in `tests/test_zoom.py`); CI installs ffmpeg and runs all |
+
+### Internship task 2: how it works
+
+```
+ recording (qscript.py)                    post-processing (apply_zoom.py, ffmpeg zoompan)
+ F5 / window.__zoomAt(x, y)                 sidecar -> pairs in/out -> smoothstep ramp ->
+   -> {t, x, y, type} -> <video>.zoom.json   crop iw/zoom x ih/zoom centred on the point -> .webm
+
+ Docker: POST /upload (file + zoom) -> row in "jobs" (pending) -> worker container takes it
+         (FOR UPDATE SKIP LOCKED) -> uploads/zoomed/<name>-job<id>.webm -> processed_video_url
+```
+
+| File | What it does |
+|---|---|
+| `qscript.py` | Changed: `ZOOM_JS` (F5, `window.__zoomAt`, green/red ring, sync marker), `ZoomRecorder` (state, events, sidecar), the scenario zooms on the search box with `ZOOM_IN_SCENARIO` |
+| `capture_video.py` | Changed: `--zoom` |
+| `apply_zoom.py` | New: sidecar parsing, pairing, easing, crop math, ffmpeg filter, `--dry-run`, `--ffmpeg`, sync calibration |
+| `zoom_worker.py` | New: the worker (queue in PostgreSQL) |
+| `web_service.py` | Changed: optional `zoom` field in `POST /upload`, table `jobs`, column `videos.processed_video_url`, `GET /jobs/<id>`, `POST /jobs/<id>/process`, `GET /media/zoomed/<file>` |
+| `video_client.py` | Changed: `UploadVideo` sends `<video>.zoom.json` with the video when it exists (signature unchanged) |
+| `Dockerfile`, `docker-compose.yml` | ffmpeg in the image, service `worker` |
+| `docs/sample.zoom.json` | Zoom events for `docs/sample.webm` (search box, then the first result) |
+| `tests/test_zoom.py`, `tests/test_zoom_capture.py`, `tests/test_zoom_service.py` | New pytest tests |
+
+Decisions worth knowing:
+- **Times come from the page.** Playwright's sync API handles calls from the page only while Python calls Playwright; the scenario sleeps a lot. The page sends `Date.now()` of the key press, so a late call does not shift the event.
+- **Sync marker.** The video starts 0.7-1.8 s after the context is created, different every run (measured, see `docs/NOTES.md`). So `t` is counted from the context, and a 12x12 magenta square in the top-left corner disappears 3 s after it. `apply_zoom.py` finds that frame in the video and moves the events by the difference; measured error after that: 0.09 s at most. The square is visible in the first seconds of every recording.
+- **Easing.** Smoothstep `p*p*(3-2*p)`, ramps of `ramp_sec` (0.5 s). The zoom-out starts at the `out` event. A pair that starts before the previous zoom-out has finished is moved after it.
+- **Worker, not a request.** Rendering takes about as long as the video, so the upload answers at once and the `worker` container renders in the background. Several workers can run: `FOR UPDATE SKIP LOCKED` and an advisory lock per job; a job of a worker that died goes back to `pending`. A new upload of the same company supersedes its old jobs and deletes the old zoomed file.
+- **Old sidecars without `type`** are read as toggles (in, out, in, ...).
+
+Limits: the 2x zoom of a 1280x720 recording is an upscale, so it is softer than the original. The sync square is in the video. Rendering is about real time on my laptop (36.8 s sample in 39 s).
 
 ## Internship task 1: how to run
 
@@ -209,12 +319,14 @@ Then, in the venv (see [Task 2: how to run the recorder](#task-2-how-to-run-the-
 
 ```powershell
 $env:DB_HOST="127.0.0.1"; $env:DB_PORT="5433"; $env:DB_NAME="videos_test"; $env:DB_USER="video_user"; $env:DB_PASSWORD="test_only"
-python -m unittest discover -s tests -v
+python -m pytest tests -v
 ```
 
-Linux/macOS: `DB_HOST=127.0.0.1 DB_PORT=5433 DB_NAME=videos_test DB_USER=video_user DB_PASSWORD=test_only python -m unittest discover -s tests -v`.
+Linux/macOS: `DB_HOST=127.0.0.1 DB_PORT=5433 DB_NAME=videos_test DB_USER=video_user DB_PASSWORD=test_only python -m pytest tests -v`.
 
 Without these variables the database tests are skipped with the reason. 57 tests, about 2 minutes, new for this task: the exact PostgreSQL schema (identity key, `UNIQUE`, `timestamptz`, no `bytea`), 8 processes creating the table at once (5 rounds), restart keeps the data, settings only from the environment and no password in errors, waiting for the database (retries, clear error after the timeout), 503 when the database is down, and all Task 2 tests (20 parallel uploads now check the advisory lock).
+
+Internship task 2 switched the runner to pytest (`pytest==8.4.2`, the last for Python 3.9; pytest also runs the older unittest classes) and added 60 tests: zoom math and sidecar parsing, real ffmpeg renders (skipped without ffmpeg, CI installs it), F5 and `__zoomAt` in Chromium, the jobs table and the worker. Now 112 tests plus 5 that need ffmpeg, about 4 minutes.
 
 CI (`.github/workflows/ci.yml`) has two jobs:
 - `test`: the tests on Python 3.9, 3.12, 3.14 with `postgres:16` as a GitHub Actions service; `REQUIRE_DB=1` makes them fail instead of skip if the database is missing.

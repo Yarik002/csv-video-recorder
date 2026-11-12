@@ -4,6 +4,10 @@ Usage:
     python capture_video.py                      # input.csv -> ./video
     python capture_video.py my.csv --video-dir out --headless
     python capture_video.py --server http://127.0.0.1:8000   # + upload and preview (Task 2)
+    python capture_video.py --zoom      # the scenario zooms in on the search box (Internship task 2)
+
+F5 during a recording toggles a zoom at the mouse point; the events go to
+<video>.zoom.json, and apply_zoom.py renders them.
 """
 
 import argparse
@@ -64,6 +68,8 @@ def main(argv=None):
     parser.add_argument("--video-dir", help=f"output folder (default: {qscript.PATH_TO_VIDEO_FOLDER})")
     parser.add_argument("--headless", action="store_true",
                         help="hide the browser window (DuckDuckGo blocks headless search)")
+    parser.add_argument("--zoom", action="store_true",
+                        help="the scenario zooms in on the search box while it types (writes <video>.zoom.json)")
     parser.add_argument("--server", metavar="URL",
                         help="upload every video to this web service (python web_service.py) "
                              "and preview it in Chromium, e.g. http://127.0.0.1:8000")
@@ -90,6 +96,8 @@ def main(argv=None):
         qscript.PATH_TO_VIDEO_FOLDER = args.video_dir
     if args.headless:
         qscript.HEADLESS = True
+    if args.zoom:
+        qscript.ZOOM_IN_SCENARIO = True
 
     try:
         rows = read_rows(args.csv)

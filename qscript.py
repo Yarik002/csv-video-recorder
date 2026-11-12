@@ -6,6 +6,7 @@ submits it and clicks the first result. Playwright records the whole session
 into a .webm file named after the company.
 """
 
+import json
 import math
 import os
 import random
@@ -35,6 +36,17 @@ SEARCH_BUTTON = 'form button[type="submit"]'
 FIRST_RESULT = 'a[data-testid="result-title-a"]'
 
 QUERY_TEMPLATE = "Magento developer in {city}"
+
+# Internship task 2: zoom events. F5 (or window.__zoomAt(x, y) from the scenario)
+# toggles a zoom at the mouse point; apply_zoom.py renders it after recording.
+# ZOOM_IN_SCENARIO = True (capture_video.py --zoom): the sample scenario zooms in on
+# the search box while it types the query.
+ZOOM_IN_SCENARIO = False
+ZOOM_FACTOR = 2.0
+ZOOM_RAMP_SEC = 0.5
+VIDEO_FPS = 25  # Playwright writes 25 fps
+SYNC_AFTER_SEC = 3.0  # the sync marker disappears this long after the context is created
+SYNC_SIZE = 12        # px, magenta square in the top-left corner
 
 PAGE_TIMEOUT_MS = 30_000
 # Results are rendered client-side and can take 10+ seconds.
@@ -195,6 +207,169 @@ OVERLAY_JS = r"""
 """
 
 
+# Zoom hotkey and hook. The state (zoomed or not) and the event list live in
+# Python (ZoomRecorder), because the page changes on every navigation. The time
+# is taken in the page (Date.now()) at the moment of the key press: Python may be
+# busy in time.sleep() and handle the call a bit later.
+#
+# Sync marker: Playwright's video starts 1-2 s after the context is created (the
+# delay changes from run to run), so "time since the context" is not "time in the
+# video". A small magenta square in the top-left corner is shown from the start
+# and removed at a known moment (SYNC_AFTER_SEC); apply_zoom.py finds the frame
+# where it disappears and shifts the events by the difference.
+ZOOM_JS = r"""
+(() => {
+  if (window.__qsZoom) return;
+  window.__qsZoom = true;
+
+  const Z = 2147483647;
+  const SYNC_AT = __SYNC_AT__;   // Date.now() value when the marker disappears
+  const SYNC_SIZE = __SYNC_SIZE__;
+
+  if (Date.now() < SYNC_AT) {
+    const sync = document.createElement('div');
+    Object.assign(sync.style, {
+      position: 'fixed', left: '0px', top: '0px', margin: '0', padding: '0',
+      width: SYNC_SIZE + 'px', height: SYNC_SIZE + 'px', background: '#ff00ff',
+      pointerEvents: 'none', zIndex: String(Z),
+    });
+    sync.setAttribute('data-qs', 'sync');
+    const put = () => {
+      if (!document.documentElement) return false;
+      document.documentElement.appendChild(sync);
+      return true;
+    };
+    if (!put()) {
+      const obs = new MutationObserver(() => { if (put()) obs.disconnect(); });
+      obs.observe(document, { childList: true });
+    }
+    setTimeout(() => {
+      sync.remove();
+      if (typeof window.__qsZoomSync === 'function') window.__qsZoomSync(Date.now());
+    }, SYNC_AT - Date.now());
+  }
+  let mx = -1, my = -1;     // last mouse position in this page
+  try {
+    const saved = JSON.parse(sessionStorage.getItem('__qs_cursor'));
+    if (saved) { mx = saved.x; my = saved.y; }
+  } catch (e) {}
+  window.addEventListener('mousemove', (e) => { mx = e.clientX; my = e.clientY; }, true);
+
+  // Our guess of the state, for the ring colour; Python has the real one.
+  let zoomed = false;
+  if (typeof window.__qsZoomState === 'function') {
+    window.__qsZoomState().then((v) => { zoomed = !!v; }, () => {});
+  }
+
+  // Indicator: a ring at the point, green = zoom in starts, red = zoom out starts.
+  function ring(x, y, type) {
+    const root = document.documentElement;
+    if (!root) return;
+    const R = 46;
+    const el = document.createElement('div');
+    Object.assign(el.style, {
+      position: 'fixed', left: '0px', top: '0px', margin: '0', padding: '0',
+      width: R * 2 + 'px', height: R * 2 + 'px', borderRadius: '50%',
+      border: '5px solid ' + (type === 'in' ? 'rgba(0, 200, 83, 0.95)' : 'rgba(229, 57, 53, 0.95)'),
+      boxSizing: 'border-box', pointerEvents: 'none', zIndex: String(Z - 1),
+      transform: `translate(${x - R}px, ${y - R}px)`,
+    });
+    el.setAttribute('data-qs', 'zoom-' + type);
+    root.appendChild(el);
+    el.animate([{ opacity: 1 }, { opacity: 1, offset: 0.6 }, { opacity: 0 }],
+               { duration: 900, fill: 'forwards' }).onfinish = () => el.remove();
+  }
+
+  function toggle(x, y) {
+    x = Math.round(x); y = Math.round(y);
+    zoomed = !zoomed;
+    ring(x, y, zoomed ? 'in' : 'out');
+    if (typeof window.__qsZoomEvent !== 'function') return Promise.resolve(null);
+    return window.__qsZoomEvent(Date.now(), x, y).then((type) => {
+      zoomed = type === 'in';
+      return type;
+    });
+  }
+
+  // For the automation scenario: same toggle as F5. Resolves to "in" or "out".
+  window.__zoomAt = (x, y) => toggle(x, y);
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key !== 'F5') return;
+    e.preventDefault();       // no page reload
+    e.stopPropagation();
+    if (e.repeat) return;     // holding the key down is one press
+    const x = mx >= 0 ? mx : innerWidth / 2, y = my >= 0 ? my : innerHeight / 2;
+    toggle(x, y);
+  }, true);
+})();
+"""
+
+
+class ZoomRecorder:
+    """Collects zoom events during one recording. t = seconds since start_time,
+    the moment the browser context (and with it the video) was created."""
+
+    def __init__(self, start_time: float, viewport=None) -> None:
+        self.start_time = start_time  # time.time()
+        self.viewport = dict(viewport or VIDEO_SIZE)
+        self.zoomed = False
+        self.events = []
+        self.sync_time = None  # time.time() when the sync marker was removed
+
+    def attach(self, context) -> None:
+        context.expose_binding("__qsZoomState", lambda source: self.zoomed)
+        context.expose_binding("__qsZoomEvent", lambda source, ms, x, y: self.toggle(ms / 1000, x, y))
+        context.expose_binding("__qsZoomSync", lambda source, ms: self._synced(ms / 1000))
+        sync_at_ms = int((self.start_time + SYNC_AFTER_SEC) * 1000)
+        context.add_init_script(
+            ZOOM_JS.replace("__SYNC_AT__", str(sync_at_ms)).replace("__SYNC_SIZE__", str(SYNC_SIZE)))
+
+    def _synced(self, when: float) -> None:
+        if self.sync_time is None:  # the first page that removed the marker
+            self.sync_time = when
+
+    def toggle(self, when: float, x: float, y: float) -> str:
+        """when: time.time() of the key press. Returns the event type."""
+        self.zoomed = not self.zoomed
+        kind = "in" if self.zoomed else "out"
+        t = round(max(0.0, when - self.start_time), 3)
+        self.events.append({"t": t, "x": int(round(x)), "y": int(round(y)), "type": kind})
+        return kind
+
+    def sidecar(self) -> dict:
+        data = {
+            "viewport": self.viewport,
+            "fps": VIDEO_FPS,
+            "zoom_factor": ZOOM_FACTOR,
+            "ramp_sec": ZOOM_RAMP_SEC,
+            "events": sorted(self.events, key=lambda e: e["t"]),
+        }
+        if self.sync_time is not None:
+            # Same clock as the events: apply_zoom.py moves both so that this
+            # moment lands on the frame where the marker disappears.
+            data["sync"] = {"t": round(self.sync_time - self.start_time, 3), "size": SYNC_SIZE}
+        return data
+
+    def write_sidecar(self, video_path: str):
+        """Writes <video>.zoom.json only when there is at least one event; otherwise
+        removes an old sidecar, so a new video never gets the zoom of an old one.
+        Returns the path or None."""
+        path = os.path.splitext(video_path)[0] + ".zoom.json"
+        if not self.events:
+            if os.path.exists(path):
+                os.remove(path)
+            return None
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.sidecar(), f, indent=2)
+        return path
+
+
+def zoom_at(page: Page, x: float, y: float) -> str:
+    """Toggles the zoom from the scenario (the automation does not press F5)."""
+    return page.evaluate("([x, y]) => window.__zoomAt(x, y)", [x, y])
+
+
 def _wait_until_still(loc, timeout_ms: int, still_ms: int = 600) -> None:
     """Waits until the element stops moving: results and suggestions keep
     shifting while they load, and a cursor aimed at a moving target misses."""
@@ -341,9 +516,17 @@ def _run_scenario(page: Page, url: str, city: str, company_name: str, steps: lis
     mouse.glide_to_element(SEARCH_BOX, PAGE_TIMEOUT_MS)
     mouse.click()
     time.sleep(0.3)
+    if ZOOM_IN_SCENARIO:
+        steps.append("zoom in on the search box")
+        zoom_at(page, mouse.x, mouse.y)
+        time.sleep(ZOOM_RAMP_SEC)
     steps.append("type the query")
     _type_like_human(page, QUERY_TEMPLATE.format(city=city))
     time.sleep(0.5)
+    if ZOOM_IN_SCENARIO:
+        steps.append("zoom out")
+        zoom_at(page, mouse.x, mouse.y)
+        time.sleep(ZOOM_RAMP_SEC)
 
     steps.append("click the search button")
     mouse.glide_to_element(SEARCH_BUTTON, PAGE_TIMEOUT_MS)
@@ -402,9 +585,12 @@ def CaptureVideo_Magento(
                     locale=_locale(language),
                     viewport=VIDEO_SIZE,
                     record_video_dir=folder,
-                    record_video_size=VIDEO_SIZE,
+                    record_video_size=VIDEO_SIZE,  # == viewport: mouse px = video px
                 )
+                # t = 0 of the zoom events: the moment the context (and the video) starts.
+                zoom = ZoomRecorder(time.time(), VIDEO_SIZE)
                 context.add_init_script(OVERLAY_JS)
+                zoom.attach(context)
                 page = context.new_page()
                 steps = []
                 try:
@@ -435,4 +621,7 @@ def CaptureVideo_Magento(
     if os.path.exists(target):
         os.remove(target)
     shutil.move(raw_video, target)
+    sidecar = zoom.write_sidecar(target)
+    if sidecar:
+        print(f"  zoom events: {len(zoom.events)} -> {sidecar}")
     return target

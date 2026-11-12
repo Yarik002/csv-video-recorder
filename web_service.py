@@ -14,6 +14,12 @@ Endpoints:
     GET  /get_video_url?company_name=...  -> {company_name, video_url}, 404 if unknown
     GET  /media/<filename>                the stored video file (Range requests work)
     GET  /videos                          all records
+Internship task 2 (zoom):
+    POST /upload with an extra file field "zoom" (<video>.zoom.json) queues a zoom job;
+         the answer then also has "job_id". zoom_worker.py renders it with ffmpeg.
+    GET  /jobs/<id>                       status of a job, processed_video_url when done
+    POST /jobs/<id>/process               run the job (again), 202
+    GET  /media/zoomed/<filename>         the processed video
 
 The uploads/ folder is next to this file. The database keeps only the path and
 the URL, the video stays on disk.
@@ -21,6 +27,7 @@ the URL, the video stays on disk.
 
 import datetime
 import hashlib
+import json
 import os
 import re
 import sys
@@ -31,6 +38,8 @@ from urllib.parse import quote
 import psycopg2
 import psycopg2.extras
 from flask import Flask, abort, current_app, g, jsonify, request, send_from_directory
+
+import apply_zoom
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAX_UPLOAD_MB = 500
@@ -45,6 +54,29 @@ CREATE TABLE IF NOT EXISTS videos (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 """
+
+# Internship task 2. ALTER ... IF NOT EXISTS: the database volume of task 1 already
+# has the videos table, CREATE TABLE IF NOT EXISTS would not add the column.
+SCHEMA_ZOOM = """
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS processed_video_url TEXT;
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id                  INTEGER     GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    video_id            INTEGER     NOT NULL REFERENCES videos (id) ON DELETE CASCADE,
+    status              TEXT        NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'running', 'done', 'failed', 'superseded')),
+    zoom                JSONB       NOT NULL,  -- the sidecar: viewport, fps, zoom_factor, ramp_sec, events
+    processed_file_path TEXT,
+    processed_video_url TEXT,
+    error               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at          TIMESTAMPTZ,
+    finished_at         TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS jobs_pending ON jobs (id) WHERE status = 'pending';
+"""
+ZOOMED_DIR = "zoomed"  # uploads/zoomed/: the rendered videos
 
 # Keys for pg_advisory_xact_lock: a lock that lives until the end of the transaction
 # and is shared by all processes that use this database.
@@ -134,6 +166,7 @@ def init_db(conn):
         lock(conn, SCHEMA_LOCK)
         with conn.cursor() as cur:
             cur.execute(SCHEMA)
+            cur.execute(SCHEMA_ZOOM)
 
 
 def get_db():
@@ -165,7 +198,9 @@ def list_videos(conn):
 
 
 def upsert_video(conn, company_name, file_path, video_url):
-    """Insert, or update the row of the same company: id and created_at stay."""
+    """Insert, or update the row of the same company: id and created_at stay.
+    A new video makes the old zoomed one stale, so processed_video_url is cleared.
+    Returns the id."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -173,10 +208,38 @@ def upsert_video(conn, company_name, file_path, video_url):
             ON CONFLICT (company_name) DO UPDATE SET
                 file_path  = EXCLUDED.file_path,
                 video_url  = EXCLUDED.video_url,
+                processed_video_url = NULL,
                 updated_at = NOW()
+            RETURNING id
             """,
             (company_name, file_path, video_url),
         )
+        return cur.fetchone()["id"]
+
+
+def supersede_jobs(conn, video_id):
+    """A new upload of the same company: its old jobs are of no use any more.
+    Returns the files of finished ones, to delete after the commit."""
+    rows = fetch(conn, """
+        UPDATE jobs SET status = 'superseded', finished_at = COALESCE(finished_at, NOW())
+        WHERE video_id = %s AND status IN ('pending', 'running', 'done')
+        RETURNING processed_file_path
+        """, (video_id,))
+    return [r["processed_file_path"] for r in rows if r["processed_file_path"]]
+
+
+def add_job(conn, video_id, zoom):
+    row = fetch(conn, "INSERT INTO jobs (video_id, zoom) VALUES (%s, %s) RETURNING id",
+                (video_id, psycopg2.extras.Json(zoom)), one=True)
+    return row["id"]
+
+
+def find_job(conn, job_id):
+    return fetch(conn, """
+        SELECT j.id, j.video_id, v.company_name, j.status, j.error, j.processed_video_url,
+               j.created_at, j.started_at, j.finished_at, j.zoom
+        FROM jobs j JOIN videos v ON v.id = j.video_id WHERE j.id = %s
+        """, (job_id,), one=True)
 
 
 def path_owner(conn, file_path):
@@ -295,6 +358,12 @@ def create_app(data_dir=None, db=None):
         ext = os.path.splitext(file.filename or "")[1].lower() or DEFAULT_EXT
         if ext not in VIDEO_TYPES:
             return error(400, f"unsupported file type {ext!r}, allowed: {', '.join(VIDEO_TYPES)}")
+        zoom = None
+        if "zoom" in request.files:  # Internship task 2: <video>.zoom.json
+            try:
+                zoom = apply_zoom.parse_sidecar(json.loads(request.files["zoom"].read().decode("utf-8")))
+            except (ValueError, UnicodeDecodeError) as exc:  # SidecarError is a ValueError
+                return error(400, f"zoom: {exc}")
 
         uploads = current_app.config["UPLOAD_FOLDER"]
         # Receive into a temporary file first, outside the database lock.
@@ -316,15 +385,45 @@ def create_app(data_dir=None, db=None):
                 file_path = os.path.join(uploads, filename)
                 replace_file(tmp_path, file_path)
                 video_url = request.host_url + "media/" + quote(filename)
-                upsert_video(conn, company_name, file_path, video_url)
+                video_id = upsert_video(conn, company_name, file_path, video_url)
+                stale = supersede_jobs(conn, video_id)
+                job_id = add_job(conn, video_id, zoom) if zoom and zoom["events"] else None
             if old is not None and old["file_path"] != file_path:
                 remove_if_unused(conn, old["file_path"])
+            for path in stale:
+                _remove_quietly(path)
         except FileBusyError as exc:
             return error(503, f"{exc} is being read right now (Windows cannot replace an open file), try again")
         finally:
             _remove_quietly(tmp_path)  # already moved on success
 
-        return jsonify(company_name=company_name, video_url=video_url)
+        if job_id is None:
+            return jsonify(company_name=company_name, video_url=video_url)
+        return jsonify(company_name=company_name, video_url=video_url, job_id=job_id,
+                       job_url=request.host_url + f"jobs/{job_id}")
+
+    @app.get("/jobs/<int:job_id>")
+    def job_status(job_id):
+        row = find_job(get_db(), job_id)
+        if row is None:
+            return error(404, "job not found", job_id=job_id)
+        return jsonify(to_json(row))
+
+    @app.post("/jobs/<int:job_id>/process")
+    def job_process(job_id):
+        """Puts the job back in the queue (for example after it failed); the worker
+        picks it up within a few seconds."""
+        conn = get_db()
+        with conn:
+            row = fetch(conn, "SELECT status FROM jobs WHERE id = %s FOR UPDATE", (job_id,), one=True)
+            if row is None:
+                return error(404, "job not found", job_id=job_id)
+            if row["status"] in ("running", "superseded"):
+                why = "is running now" if row["status"] == "running" else "is for an older upload"
+                return error(409, f"job {job_id} {why}", job_status=row["status"])
+            fetch(conn, """UPDATE jobs SET status = 'pending', error = NULL, started_at = NULL,
+                           finished_at = NULL WHERE id = %s RETURNING id""", (job_id,))
+        return jsonify(to_json(find_job(conn, job_id))), 202
 
     @app.get("/get_video_url")
     def get_video_url():
@@ -346,12 +445,19 @@ def create_app(data_dir=None, db=None):
         # so the player can seek.
         return send_from_directory(current_app.config["UPLOAD_FOLDER"], filename, mimetype=mimetype)
 
+    @app.get("/media/zoomed/<filename>")
+    def media_zoomed(filename):
+        if filename.startswith("."):  # unfinished renders
+            abort(404)
+        return send_from_directory(os.path.join(current_app.config["UPLOAD_FOLDER"], ZOOMED_DIR),
+                                   filename, mimetype=VIDEO_TYPES.get(os.path.splitext(filename)[1].lower()))
+
     @app.get("/videos")
     def videos():
         return jsonify(videos=[to_json(row) for row in list_videos(get_db())])
 
     # Errors are JSON too, so the client can show the reason.
-    for code in (400, 404, 405, 413, 500):
+    for code in (400, 404, 405, 409, 413, 500):
         app.register_error_handler(code, _json_error)
     for exc_class in (psycopg2.OperationalError, psycopg2.InterfaceError):
         app.register_error_handler(exc_class, _db_down)

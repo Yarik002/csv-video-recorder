@@ -62,4 +62,4 @@ def sql(query, args=(), dicts=False):
 
 def reset_db():
     """No table, like a fresh database: create_app() must create it."""
-    sql("DROP TABLE IF EXISTS videos")
+    sql("DROP TABLE IF EXISTS jobs, videos")

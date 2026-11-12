@@ -1,4 +1,5 @@
-# Two containers: web (Apache + mod_wsgi + the Flask service) and db (PostgreSQL 16).
+# Three containers: web (Apache + mod_wsgi + the Flask service), worker (renders the
+# zoom of uploaded videos with ffmpeg, Internship task 2) and db (PostgreSQL 16).
 # Start: copy .env.example to .env, set DB_PASSWORD there, then "docker compose up --build".
 # The password lives only in .env, which is not in git.
 
@@ -9,8 +10,8 @@ services:
       - "8000:80"              # http://localhost:8000 -> Apache on port 80 in the container
     volumes:
       - uploads:/app/uploads   # the videos survive "docker compose down"
-    environment:
-      DB_HOST: db              # the service name is the host name inside the Compose network
+    environment: &db-env
+      DB_HOST: db             # the service name is the host name inside the Compose network
       DB_PORT: 5432
       DB_NAME: ${DB_NAME:-videos}
       DB_USER: ${DB_USER:-video_user}
@@ -25,6 +26,21 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+
+  worker:
+    # The same image as web, another command: takes pending zoom jobs from PostgreSQL,
+    # renders them with ffmpeg into uploads/zoomed/ and stores the URL.
+    build: .
+    command: ["/opt/venv/bin/python", "/app/zoom_worker.py"]
+    user: www-data             # like the Apache app: both write to the uploads volume
+    volumes:
+      - uploads:/app/uploads
+    environment: *db-env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_signal: SIGINT        # Python stops at once; a job left "running" is queued again on start
 
   db:
     image: postgres:16

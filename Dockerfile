@@ -1,4 +1,5 @@
 # Image of the "web" service: Apache + mod_wsgi + the Flask video service.
+# The "worker" service (zoom_worker.py, Internship task 2) runs from the same image.
 #
 # mod_wsgi must be built for the same Python that runs the app. The image has
 # Python 3.12, and mod_wsgi is built for it with pip; "mod_wsgi-express module-config"
@@ -16,9 +17,10 @@ RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements-docker.txt
 
 FROM python:3.12-slim-bookworm
 # apache2: the web server; libpq5: the PostgreSQL client library psycopg2 needs;
-# curl: the healthcheck and "docker compose exec web curl http://localhost/videos".
+# curl: the healthcheck and "docker compose exec web curl http://localhost/videos";
+# ffmpeg (has zoompan and libvpx-vp9): the zoom post-processing (Internship task 2).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends apache2 libpq5 curl \
+ && apt-get install -y --no-install-recommends apache2 libpq5 curl ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/venv /opt/venv
@@ -35,7 +37,7 @@ COPY apache/video-service.conf /etc/apache2/sites-available/
 RUN a2ensite video-service
 
 WORKDIR /app
-COPY web_service.py web_service.wsgi ./
+COPY web_service.py web_service.wsgi apply_zoom.py zoom_worker.py ./
 # The app runs as www-data and writes the videos here. A new named volume mounted
 # on /app/uploads copies this owner, so the app can write to it.
 RUN mkdir -p /app/uploads && chown www-data:www-data /app/uploads

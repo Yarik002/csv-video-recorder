@@ -109,6 +109,7 @@ class StartupTest(ServiceTestCase):
             ("video_url", "text", "NO", "NO"),
             ("created_at", "timestamp with time zone", "NO", "NO"),
             ("updated_at", "timestamp with time zone", "NO", "NO"),
+            ("processed_video_url", "text", "YES", "NO"),  # Internship task 2
         ])
         self.assertNotIn("bytea", [c[1] for c in columns])  # no video bytes in the database
         self.assertEqual(self.constraint_columns("PRIMARY KEY"), [("id",)])
@@ -239,7 +240,8 @@ class RunAsScriptTest(unittest.TestCase):
         os.makedirs(service_dir)
         os.makedirs(cwd)
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        shutil.copy(os.path.join(root, "web_service.py"), service_dir)
+        for name in ("web_service.py", "apply_zoom.py"):  # the service imports apply_zoom (task 2)
+            shutil.copy(os.path.join(root, name), service_dir)
         port = free_port()
         env = dict(os.environ, FLASK_HOST="127.0.0.1", FLASK_PORT=str(port))
         env.update({name: SETTINGS[key] for key, name in web_service.DB_ENV.items()})
@@ -366,7 +368,7 @@ class LookupAndListTest(ServiceTestCase):
         videos = self.client.get("/videos").get_json()["videos"]
         self.assertEqual([v["company_name"] for v in videos], ["Alpha", "Mid", "Zeta"])
         self.assertEqual(set(videos[0]), {"id", "company_name", "file_path", "video_url",
-                                          "created_at", "updated_at"})
+                                          "created_at", "updated_at", "processed_video_url"})
         created = datetime.datetime.fromisoformat(videos[0]["created_at"])  # ISO 8601 text
         self.assertIsNotNone(created.tzinfo)
 
