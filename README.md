@@ -84,7 +84,7 @@ Checked on Windows 11 with Docker Desktop on 12-13 November 2026, and in CI.
 | 7 | The zoom centres on the exact mouse point and stays within the frame | real render of a red square at (900, 200): in the hold it is at (640, 360) and twice as big; near a corner the crop sticks to the edges |
 | 8 | Smooth (ease-in, hold, ease-out), several pairs | tests: smoothstep ramp frame by frame, 2 pairs, overlapping pairs moved; frames of real renders looked at by eye |
 | 9 | Post-processing runs in the Docker stack and stores the result in PostgreSQL | `curl` upload with `zoom=@docs/sample.zoom.json`, the `worker` container rendered it, `jobs` and `videos.processed_video_url` filled, Apache serves the file (200 `video/webm`, Range 206); live run: 3 recordings rendered by the worker; CI job `docker` does the same and checks it after `down`/`up` |
-| 10 | Tests pass locally and in CI | `python -m pytest tests`: 112 passed, 5 skipped (the ffmpeg tests: no ffmpeg on my Windows, they passed in a container with ffmpeg, 39 of 39 in `tests/test_zoom.py`); CI installs ffmpeg and runs all |
+| 10 | Tests pass locally and in CI | `python -m pytest tests`: 112 passed, 5 skipped (the ffmpeg tests: no ffmpeg on my Windows, they passed in a container with ffmpeg, 39 of 39 in `tests/test_zoom.py`); CI installs ffmpeg: 117 passed on Python 3.9, 3.12, 3.14, and the `docker` job is green |
 
 ### Internship task 2: how it works
 
@@ -115,6 +115,8 @@ Decisions worth knowing:
 - **Easing.** Smoothstep `p*p*(3-2*p)`, ramps of `ramp_sec` (0.5 s). The zoom-out starts at the `out` event. A pair that starts before the previous zoom-out has finished is moved after it.
 - **Worker, not a request.** Rendering takes about as long as the video, so the upload answers at once and the `worker` container renders in the background. Several workers can run: `FOR UPDATE SKIP LOCKED` and an advisory lock per job; a job of a worker that died goes back to `pending`. A new upload of the same company supersedes its old jobs and deletes the old zoomed file.
 - **Old sidecars without `type`** are read as toggles (in, out, in, ...).
+
+Before sending I cloned the repository from GitHub into an empty folder and followed this section: fresh volumes, `docker compose up --build -d --wait`, the `curl` upload with `zoom=`, the worker rendered it in 49 s, the result 200 `video/webm`; the tests in a new Python 3.14 venv: 112 passed, 5 skipped (no ffmpeg on Windows).
 
 Limits: the 2x zoom of a 1280x720 recording is an upscale, so it is softer than the original. The sync square is in the video. Rendering is about real time on my laptop (36.8 s sample in 39 s).
 
